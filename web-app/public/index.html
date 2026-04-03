@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zero Trust IAM - Login</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="login-card">
+      <h1>Zero Trust IAM</h1>
+      <p class="subtitle">Blockchain-Backed Identity & Access Management</p>
+
+      <form id="loginForm">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" required autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required>
+        </div>
+        <div class="form-group">
+          <label for="resource">Requested Resource</label>
+          <select id="resource" name="resource">
+            <option value="read">Read</option>
+            <option value="write">Write</option>
+            <option value="delete">Delete</option>
+            <option value="manage">Manage</option>
+          </select>
+        </div>
+
+        <div class="context-info">
+          <h3>Context Metadata</h3>
+          <div class="form-group">
+            <label for="locationCountry">Country</label>
+            <input type="text" id="locationCountry" value="IN" placeholder="e.g., IN">
+          </div>
+          <div class="form-group">
+            <label for="locationCity">City</label>
+            <input type="text" id="locationCity" value="Gwalior" placeholder="e.g., Gwalior">
+          </div>
+          <p class="meta-text">Device ID: <span id="deviceIdDisplay">-</span></p>
+        </div>
+
+        <button type="submit" id="submitBtn">Authenticate</button>
+      </form>
+
+      <div id="mfaPanel" class="mfa-panel hidden">
+        <h3>MFA Step-Up Required</h3>
+        <p id="mfaReason" class="meta-text"></p>
+        <div class="form-group">
+          <label for="mfaCode">TOTP Code</label>
+          <input type="text" id="mfaCode" maxlength="6" pattern="[0-9]{6}" placeholder="Enter 6-digit code" autocomplete="one-time-code">
+        </div>
+        <button id="mfaSubmitBtn" type="button">Verify MFA</button>
+      </div>
+
+      <div id="result" class="result hidden">
+        <div id="resultBanner" class="result-banner"></div>
+        <div id="resultDetails" class="result-details"></div>
+      </div>
+
+      <div id="sessionPanel" class="session-panel hidden">
+        <h3>Active Session</h3>
+        <div id="sessionDetails" class="result-details"></div>
+        <button id="logoutBtn" class="logout-btn">Logout</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

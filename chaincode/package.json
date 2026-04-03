@@ -1,0 +1,13 @@
+{
+  "name": "iam-chaincode",
+  "version": "1.0.0",
+  "description": "Zero Trust IAM Smart Contract",
+  "main": "index.js",
+  "scripts": {
+    "start": "fabric-chaincode-node start"
+  },
+  "dependencies": {
+    "fabric-contract-api": "~2.5",
+    "fabric-shim": "~2.5"
+  }
+}
