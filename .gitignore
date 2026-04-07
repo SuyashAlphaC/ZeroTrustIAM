@@ -1,0 +1,6 @@
+node_modules/
+policy-engine/data/
+policy-engine/.env
+*.db
+*.db-wal
+*.db-shm

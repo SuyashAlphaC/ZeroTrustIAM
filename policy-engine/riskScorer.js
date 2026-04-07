@@ -1,3 +1,7 @@
+'use strict';
+
+const config = require('./config');
+
 // In-memory failed attempt counter (keyed by username)
 const failedAttempts = new Map();
 
@@ -20,17 +24,14 @@ function resetFailedAttempts(username) {
  *
  * R = w1*d_score + w2*l_score + w3*t_score + w4*a_score
  *
- * Weights assigned via AHP:
- *   w1 (device)   = 0.40
- *   w2 (location) = 0.30
- *   w3 (time)     = 0.20
- *   w4 (attempts) = 0.10
+ * Weights loaded from config (overridable via environment variables).
+ * Defaults via AHP: w1=0.40, w2=0.30, w3=0.20, w4=0.10
  */
 function computeRiskScore(userProfile, requestContext) {
-  const W1 = 0.40; // device weight
-  const W2 = 0.30; // location weight
-  const W3 = 0.20; // time weight
-  const W4 = 0.10; // attempt weight
+  const W1 = config.riskWeights.device;
+  const W2 = config.riskWeights.location;
+  const W3 = config.riskWeights.time;
+  const W4 = config.riskWeights.attempts;
 
   // Device score: 1 if device is not registered, 0 if known
   const d_score = userProfile.registeredDevices.includes(requestContext.deviceId) ? 0 : 1;

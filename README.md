@@ -28,7 +28,8 @@ The system implements **12 security layers** -- from bcrypt password hashing and
 10. [API Reference](#10-api-reference)
 11. [Attack Simulations](#11-attack-simulations)
 12. [Technology Stack](#12-technology-stack)
-13. [Troubleshooting](#13-troubleshooting)
+13. [Production Architecture](#13-production-architecture)
+14. [Troubleshooting](#14-troubleshooting)
 
 ---
 
@@ -204,8 +205,8 @@ This project is **the first open-source implementation** that integrates all of 
 
 1. **User submits login** via the web app (username, password, device ID, location, timestamp, requested permission)
 2. **Web app relays** the request to the policy engine at `:4000/evaluate` -- the web app makes NO security decisions
-3. **Policy engine verifies credentials** against bcrypt hashes (cost factor 12)
-4. **Risk score is computed**: `R = 0.40*d + 0.30*l + 0.20*t + 0.10*a` using AHP weights
+3. **Policy engine verifies credentials** against bcrypt hashes (configurable cost factor, default 12)
+4. **Risk score is computed**: `R = w1*d + w2*l + w3*t + w4*a` using config-driven AHP weights (default: 0.40, 0.30, 0.20, 0.10)
 5. **ML anomaly detector adjusts** the risk score based on behavioral deviation (time patterns, location novelty, impossible travel, login frequency, device novelty)
 6. **Threshold gate**: If adjusted `R >= 0.6`, the request is denied immediately
 7. **MFA step-up check**: If `R >= 0.3` or operation is sensitive (write/delete/manage) with any risk, a TOTP challenge is issued
@@ -315,7 +316,7 @@ R = 0.40 * d_score + 0.30 * l_score + 0.20 * t_score + 0.10 * a_score
 - **Refresh tokens** (7-day expiry): Used to obtain new access tokens without re-authentication. Stored server-side in a revocation set, enabling instant logout.
 - **Token rotation**: Each refresh produces a new access token. Revoked refresh tokens are immediately rejected.
 
-**Implementation**: `policy-engine/server.js` uses `bcrypt.compare()` for constant-time password verification and `jsonwebtoken` for RS256/HS256 signed tokens.
+**Implementation**: `policy-engine/server.js` uses `bcrypt.compare()` for constant-time password verification and `jsonwebtoken` for HS256 signed tokens. JWT signing keys are persisted in the `signing_keys` database table, ensuring tokens remain valid across server restarts. The bcrypt cost factor is configurable via `BCRYPT_ROUNDS`.
 
 ### 5.3 OAuth 2.0 / OpenID Connect
 
@@ -337,7 +338,7 @@ R = 0.40 * d_score + 0.30 * l_score + 0.20 * t_score + 0.10 * a_score
 - **State parameter**: CSRF protection via the `state` parameter in the authorization flow.
 - **Nonce binding**: The `nonce` parameter in the ID token prevents token replay.
 
-**Implementation**: `policy-engine/oauth.js` manages RSA key generation, authorization codes, token issuance, and JWKS publication.
+**Implementation**: `policy-engine/oauth.js` manages RSA key generation, authorization codes, token issuance, and JWKS publication. RSA signing keys and authorization codes are persisted in the database, ensuring OIDC tokens remain verifiable across restarts and codes cannot be replayed.
 
 ### 5.4 TOTP Multi-Factor Authentication with Step-Up
 
@@ -506,7 +507,7 @@ adjusted_risk = base_risk + anomaly_combined * 0.15
 
 The anomaly contribution (weight 0.15) is additive to the AHP-based risk score, allowing behavioral signals to push a borderline request over the threshold.
 
-**Implementation**: `policy-engine/anomalyDetector.js` maintains per-user behavioral profiles, implements Welford's algorithm for online statistics, and provides diagnostic endpoints for inspecting learned profiles.
+**Implementation**: `policy-engine/anomalyDetector.js` maintains per-user behavioral profiles in the `anomaly_profiles` database table, implements Welford's algorithm for online statistics, and provides diagnostic endpoints for inspecting learned profiles. Profiles persist across server restarts, allowing the model to continuously learn without data loss.
 
 ### 5.8 Zero-Knowledge Proof Risk Verification
 
@@ -612,16 +613,31 @@ ZeroTrustIAM/
 │
 ├── policy-engine/                        # Zero Trust authentication + risk scoring
 │   ├── server.js                         # Express :4000, orchestrates full auth flow
-│   ├── riskScorer.js                     # R = 0.40d + 0.30l + 0.20t + 0.10a
-│   ├── anomalyDetector.js                # ML behavioral anomaly detection (5 signals)
+│   ├── config.js                         # Centralized config (env-driven, requireEnv for prod)
+│   ├── logger.js                         # Structured logging (pino + pino-pretty)
+│   ├── middleware.js                     # Helmet, rate limiters, JWT auth, RBAC, validation
+│   ├── database.js                       # SQLite persistence (WAL mode, prepared statements)
+│   ├── riskScorer.js                     # R = w1*d + w2*l + w3*t + w4*a (config-driven)
+│   ├── anomalyDetector.js                # ML behavioral anomaly detection (5 signals, DB-backed)
 │   ├── zkpVerifier.js                    # Pedersen commitment ZKP range proofs
-│   ├── mfa.js                            # TOTP MFA with step-up authentication
-│   ├── oauth.js                          # OAuth 2.0 / OIDC (RS256, JWKS, discovery)
-│   ├── webauthn.js                       # WebAuthn/FIDO2 passkey management
-│   ├── didResolver.js                    # W3C DID resolver + Verifiable Credentials
+│   ├── mfa.js                            # TOTP MFA with step-up authentication (DB-backed)
+│   ├── oauth.js                          # OAuth 2.0 / OIDC (RS256 keys DB-persisted)
+│   ├── webauthn.js                       # WebAuthn/FIDO2 passkey management (DB-backed)
+│   ├── didResolver.js                    # W3C DID resolver + Verifiable Credentials (DB-backed)
 │   ├── fabricClient.js                   # Hyperledger Fabric Gateway SDK client
 │   ├── mockBlockchain.js                 # In-memory mock (USE_MOCK=true)
-│   └── package.json                      # bcrypt, jsonwebtoken, otplib, @simplewebauthn, etc.
+│   ├── .env.example                      # Reference environment config with all variables
+│   ├── jest.config.js                    # Jest test configuration (ESM compatibility)
+│   ├── package.json                      # bcrypt, jsonwebtoken, otplib, better-sqlite3, etc.
+│   └── __tests__/
+│       ├── unit/
+│       │   ├── riskScorer.test.js        # AHP risk scoring unit tests
+│       │   ├── anomalyDetector.test.js   # Anomaly detection unit tests (DB-backed)
+│       │   ├── zkpVerifier.test.js       # ZKP proof generation/verification tests
+│       │   ├── database.test.js          # Database CRUD and constraint tests
+│       │   └── mockBlockchain.test.js    # Mock blockchain unit tests
+│       └── integration/
+│           └── api.test.js               # Full API integration tests (supertest)
 │
 ├── chaincode/                            # Hyperledger Fabric smart contract
 │   ├── Dockerfile                        # Node.js Alpine image for CCaaS
@@ -662,7 +678,71 @@ ZeroTrustIAM/
 
 ## 9. Quick Start Guide
 
-### 9.1 Start the Hyperledger Fabric Network
+### 9.1 Environment Setup
+
+```bash
+# Install dependencies
+cd policy-engine && npm install
+cd ../web-app && npm install
+```
+
+Copy the reference environment file and customize:
+
+```bash
+cd policy-engine
+cp .env.example .env
+```
+
+The `.env` file controls all runtime behavior. Key variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NODE_ENV` | `development` | Set to `production` for production mode |
+| `USE_MOCK` | `true` | `true` = in-memory mock blockchain, `false` = real Fabric |
+| `SEED_DEMO` | `true` | Seeds `alice`/`bob` test users. **Never set in production** |
+| `JWT_SECRET` | auto-generated | **REQUIRED in production** -- HMAC key for access tokens |
+| `JWT_REFRESH_SECRET` | auto-generated | **REQUIRED in production** -- HMAC key for refresh tokens |
+| `OAUTH_DEFAULT_CLIENT_SECRET` | auto-generated | **REQUIRED in production** -- OAuth client secret |
+| `DB_PATH` | `./data/iam.db` | SQLite database file path |
+| `BCRYPT_ROUNDS` | `12` | bcrypt cost factor (2^N iterations) |
+| `LOG_LEVEL` | `info` | Pino log level (`debug`, `info`, `warn`, `error`) |
+
+See `.env.example` for the complete list of 30+ configurable variables (risk weights, rate limits, Fabric connection, WebAuthn, MFA, etc.).
+
+### 9.2 Development Mode (Mock Blockchain, No Docker)
+
+The fastest way to run the system locally without Hyperledger Fabric:
+
+```bash
+# Terminal 1: Policy Engine (mock blockchain + demo users)
+cd policy-engine
+USE_MOCK=true SEED_DEMO=true node server.js
+
+# Terminal 2: Web App
+cd web-app
+node server.js
+```
+
+Open **http://localhost:3000** in your browser.
+
+**Demo users** (only available when `SEED_DEMO=true`):
+
+| Username | Password | Role | Registered Device | Usual Location |
+|----------|----------|------|-------------------|----------------|
+| alice | pass123 | admin | dev-001 | IN / Gwalior |
+| bob | bob456 | viewer | dev-002 | IN / Delhi |
+
+**Try these experiments:**
+
+1. **Normal login**: Log in as `alice` with default settings -- ACCESS GRANTED with risk score 0.00
+2. **Foreign location**: Change country to `RU` -- MFA_REQUIRED (risk = 0.30 >= step-up threshold)
+3. **Unknown device**: Change device ID to something random -- DENY (smart contract: unregistered device)
+4. **Privilege escalation**: Log in as `bob` and request `delete` permission -- DENY (RBAC: viewer lacks delete)
+5. **Cumulative attack**: Unknown device + foreign country + off-hours = risk 0.90 -- DENY
+
+### 9.3 Production Mode (Real Fabric Network)
+
+#### Start the Hyperledger Fabric Network
 
 ```bash
 cd fabric-network
@@ -683,16 +763,27 @@ This starts 4 Docker containers:
 - `iam-chaincode` -- Smart contract running as a service (port 9999)
 - `cli` -- Fabric CLI tools
 
-### 9.2 Install Dependencies
+#### Configure Production Environment
+
+Generate secrets and set required variables:
 
 ```bash
-cd ../policy-engine && npm install
-cd ../web-app && npm install
+cd policy-engine
+
+# Generate JWT secrets
+export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(64).toString('hex'))")
+export JWT_REFRESH_SECRET=$(node -e "console.log(require('crypto').randomBytes(64).toString('hex'))")
+export OAUTH_DEFAULT_CLIENT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+
+# Production settings
+export NODE_ENV=production
+export USE_MOCK=false
+# SEED_DEMO is NOT set -- no demo users in production
 ```
 
-### 9.3 Start the Application
+The server will refuse to start in `NODE_ENV=production` if `JWT_SECRET`, `JWT_REFRESH_SECRET`, or `OAUTH_DEFAULT_CLIENT_SECRET` are missing.
 
-In two separate terminals:
+#### Start the Application
 
 ```bash
 # Terminal 1: Policy Engine (connects to real Fabric network)
@@ -701,35 +792,40 @@ node server.js
 
 # Terminal 2: Web App
 cd web-app
-node server.js
+OAUTH_CLIENT_SECRET=$OAUTH_DEFAULT_CLIENT_SECRET node server.js
 ```
 
-### 9.4 Use the System
-
-Open **http://localhost:3000** in your browser.
-
-**Test users:**
-
-| Username | Password | Role | Registered Device | Usual Location |
-|----------|----------|------|-------------------|----------------|
-| alice | pass123 | admin | dev-001 | IN / Gwalior |
-| bob | bob456 | viewer | dev-002 | IN / Delhi |
-
-**Try these experiments:**
-
-1. **Normal login**: Log in as `alice` with default settings -- ACCESS GRANTED with risk score 0.00
-2. **Foreign location**: Change country to `RU` -- MFA_REQUIRED (risk = 0.30 >= step-up threshold)
-3. **Unknown device**: Change device ID to something random -- DENY (smart contract: unregistered device)
-4. **Privilege escalation**: Log in as `bob` and request `delete` permission -- DENY (RBAC: viewer lacks delete)
-5. **Cumulative attack**: Unknown device + foreign country + off-hours = risk 0.90 -- DENY
-
-### 9.5 Run Attack Simulations
+### 9.4 Run Tests
 
 ```bash
+cd policy-engine
+
+# Run all tests (unit + integration)
+SEED_DEMO=true USE_MOCK=true npm test
+
+# Unit tests only
+SEED_DEMO=true USE_MOCK=true npm run test:unit
+
+# Integration tests only (starts server on random port)
+SEED_DEMO=true USE_MOCK=true npm run test:integration
+```
+
+The test suite includes:
+- **Unit tests**: risk scoring, anomaly detection, ZKP proofs, database CRUD, mock blockchain
+- **Integration tests**: full API endpoint testing with supertest (auth flows, token management, MFA, OAuth, DIDs)
+
+#### Run E2E Attack Simulations
+
+```bash
+# Start the server first
+cd policy-engine
+SEED_DEMO=true USE_MOCK=true node server.js &
+
+# Run 7 attack scenarios (12 total tests)
 node test/attack-scenarios.js
 ```
 
-Runs 7 attack scenarios (12 total tests):
+Scenarios tested:
 
 1. **Brute Force** -- 5 failed passwords escalate the attempt score
 2. **Stolen Credentials + Unknown Device** -- Smart contract blocks unregistered device
@@ -739,7 +835,7 @@ Runs 7 attack scenarios (12 total tests):
 6. **Privilege Escalation** -- Viewer role denied delete permission (RBAC)
 7. **Cumulative Risk** -- Unknown device + foreign country + off-hours = R=0.90, denied
 
-### 9.6 View Audit Log
+### 9.5 View Audit Log
 
 ```bash
 curl http://localhost:4000/audit-log | python3 -m json.tool
@@ -747,25 +843,11 @@ curl http://localhost:4000/audit-log | python3 -m json.tool
 
 Each entry contains: `txId`, `userId`, `deviceId`, `riskScore`, `decision`, `reason`, `timestamp`.
 
-### 9.7 Teardown
+### 9.6 Teardown
 
 ```bash
 cd fabric-network
 bash scripts/teardown.sh
-```
-
-### Running with Mock Blockchain (No Docker Required)
-
-```bash
-cd policy-engine
-USE_MOCK=true node server.js
-
-cd ../web-app
-node server.js
-
-# Run tests
-bash test/test-phase1.sh
-node test/attack-scenarios.js
 ```
 
 ---
@@ -910,14 +992,20 @@ The system defends against the following attack vectors:
 | Frontend | HTML, CSS, JavaScript | Login UI, session management |
 | Web Server | Node.js, Express | Static serving, API proxying |
 | Policy Engine | Node.js, Express | Authentication, risk scoring, orchestration |
-| Password Hashing | bcrypt (cost 12) | Adaptive password storage |
+| Database | SQLite via better-sqlite3 (WAL mode) | Persistent storage for all state (users, tokens, MFA, DIDs, WebAuthn, anomaly profiles) |
+| Password Hashing | bcrypt (configurable cost factor) | Adaptive password storage |
 | Session Tokens | JSON Web Tokens (HS256/RS256) | Stateless session management |
-| OAuth / OIDC | Custom (RS256, JWKS) | Delegated authorization, identity federation |
+| OAuth / OIDC | Custom (RS256, JWKS, DB-persisted keys) | Delegated authorization, identity federation |
 | MFA | otplib (TOTP, RFC 6238) | Time-based one-time passwords |
 | Passwordless | @simplewebauthn/server (FIDO2) | WebAuthn passkey management |
 | Decentralized Identity | Custom W3C DID resolver | Self-sovereign identity |
 | Anomaly Detection | Custom ML (Welford's algorithm) | Behavioral baseline + deviation scoring |
 | Zero-Knowledge Proofs | Custom (Pedersen commitments) | Privacy-preserving risk verification |
+| Structured Logging | Pino + pino-pretty | JSON structured logs with request tracing |
+| Security Middleware | Helmet + express-rate-limit | HTTP hardening, rate limiting, input validation |
+| Input Validation | Joi | Schema-based request validation |
+| Configuration | dotenv + centralized config.js | Environment-driven config with production enforcement |
+| Testing | Jest + supertest | Unit tests, integration tests, ESM compatibility |
 | Blockchain | Hyperledger Fabric 2.5.12 | Permissioned ledger, smart contracts |
 | Smart Contract | JavaScript (fabric-contract-api) | On-chain authorization + audit |
 | Blockchain SDK | @hyperledger/fabric-gateway | gRPC client for Fabric |
@@ -929,7 +1017,68 @@ The system defends against the following attack vectors:
 
 ---
 
-## 13. Troubleshooting
+## 13. Production Architecture
+
+### 13.1 Database-Backed State (No Split-Brain)
+
+All application state is persisted in a single SQLite database (`data/iam.db`) using WAL (Write-Ahead Logging) mode for concurrent read performance. No module uses in-memory Maps for state -- every record is the database's single source of truth:
+
+| Table | Purpose |
+|-------|---------|
+| `users` | User accounts with bcrypt password hashes and roles |
+| `signing_keys` | JWT and OAuth RSA keys (persisted across restarts) |
+| `refresh_tokens` | Active refresh tokens with expiry tracking |
+| `revoked_tokens` | Revoked access/refresh tokens |
+| `mfa_secrets` | TOTP shared secrets per user |
+| `mfa_challenges` | Active MFA step-up challenges with TTL |
+| `oauth_clients` | Registered OAuth 2.0 clients |
+| `oauth_codes` | Single-use authorization codes |
+| `dids` | W3C DID Documents |
+| `verifiable_credentials` | W3C Verifiable Credentials |
+| `webauthn_credentials` | FIDO2 public keys, counters, transports |
+| `webauthn_challenges` | Active WebAuthn registration/login challenges |
+| `anomaly_profiles` | Per-user behavioral baselines (Welford statistics) |
+| `failed_attempts` | Per-user failed login counters |
+
+A background cleanup job (configurable via `CLEANUP_INTERVAL_MS`, default 5 minutes) purges expired tokens, challenges, and authorization codes.
+
+### 13.2 Configuration Enforcement
+
+The `config.js` module centralizes all tunable parameters. In production (`NODE_ENV=production`):
+
+- `requireEnv()` enforces that `JWT_SECRET`, `JWT_REFRESH_SECRET`, and `OAUTH_DEFAULT_CLIENT_SECRET` are set via environment variables. The server will crash at startup with a `FATAL` error if any are missing.
+- Demo data seeding (`SEED_DEMO`) is ignored in production mode regardless of its value.
+- All AHP risk weights, thresholds, rate limits, token expiries, and Fabric connection parameters are overridable via environment variables.
+
+### 13.3 Structured Logging
+
+All modules use `pino` for structured JSON logging (configured via `logger.js`). Request-level logging is handled by middleware that logs method, URL, status code, and response time. Log level is controlled via `LOG_LEVEL` environment variable.
+
+### 13.4 Security Middleware Stack
+
+Every request passes through the following middleware chain (defined in `middleware.js`):
+
+1. **Helmet** -- Sets secure HTTP headers (CSP, HSTS, X-Frame-Options, etc.)
+2. **Global rate limiter** -- 30 requests per minute per IP (configurable)
+3. **Auth rate limiter** -- 10 requests per minute on `/evaluate` and `/oauth/token` (configurable)
+4. **JWT authentication** (`requireAuth`) -- Validates Bearer tokens on protected endpoints
+5. **RBAC enforcement** (`requireRole`) -- Checks role-based permissions
+6. **Input validation** (`validate`) -- Joi schema validation on request bodies
+7. **Error handler** -- Catches unhandled errors, returns sanitized responses
+
+### 13.5 Test Pyramid
+
+| Layer | Count | Tool | What It Covers |
+|-------|-------|------|----------------|
+| Unit | ~85 | Jest | Risk scoring, anomaly detection, ZKP proofs, database CRUD, mock blockchain |
+| Integration | ~6 | Jest + supertest | Full API flows (auth, tokens, MFA, OAuth, DIDs) with isolated test DB |
+| E2E | 12 | Node.js + fetch | 7 attack scenarios against a running server |
+
+Tests use isolated SQLite databases (`:memory:` or temp files) and random ports to avoid conflicts with running servers.
+
+---
+
+## 14. Troubleshooting
 
 **Chaincode container exits immediately**
 Check logs: `docker logs iam-chaincode`. The `CHAINCODE_ID` env var must match the installed package ID. Re-run `deploy-chaincode.sh`.
@@ -958,6 +1107,21 @@ This is by design. bcrypt with cost factor 12 takes ~250ms per hash verification
 
 **WebAuthn only works on localhost**
 WebAuthn requires a secure context (HTTPS or localhost). For non-localhost deployments, configure TLS certificates.
+
+**"FATAL: Environment variable X is required in production mode"**
+Set the required secrets before starting in production. Generate them with:
+```bash
+node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+```
+
+**"User not found" when SEED_DEMO is not set**
+Without `SEED_DEMO=true`, no demo users are created. Register users through the API or set `SEED_DEMO=true` for development.
+
+**Tests fail with "EADDRINUSE :4000"**
+A server is already running on port 4000. Integration tests automatically use a random port (`PORT=0`), but E2E tests (`attack-scenarios.js`) expect port 4000. Stop the running server or set a different port.
+
+**Jest ESM errors ("Unexpected token export")**
+The project includes `jest.config.js` with `transformIgnorePatterns` for ESM-only packages (`uuid`, `otplib`, `@scure`, `@noble`, `@simplewebauthn`, `cbor-x`). If adding new ESM dependencies, add them to the transform ignore pattern.
 
 ---
 

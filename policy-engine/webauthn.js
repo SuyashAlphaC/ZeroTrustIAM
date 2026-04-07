@@ -1,3 +1,5 @@
+'use strict';
+
 const {
   generateRegistrationOptions,
   verifyRegistrationResponse,
@@ -5,24 +7,23 @@ const {
   verifyAuthenticationResponse,
 } = require('@simplewebauthn/server');
 
-// WebAuthn configuration
-const RP_NAME = 'Zero Trust IAM';
-const RP_ID = 'localhost';
-const ORIGIN = 'http://localhost:3000';
+const config = require('./config');
+const db = require('./database');
 
-// In-memory stores
-const authenticators = new Map(); // userId -> [{ credentialID, credentialPublicKey, counter, transports }]
-const challenges = new Map(); // challengeId -> { challenge, userId, type, expiresAt }
+/**
+ * WebAuthn/FIDO2 module — fully database-backed.
+ * Credentials and challenges persist in SQLite.
+ */
 
 /**
  * Generate registration options for a user to register a new passkey.
  */
 async function getRegistrationOptions(userId) {
-  const userAuthenticators = authenticators.get(userId) || [];
+  const userAuthenticators = db.getWebAuthnCredentials(userId);
 
   const options = await generateRegistrationOptions({
-    rpName: RP_NAME,
-    rpID: RP_ID,
+    rpName: config.webauthnRpName,
+    rpID: config.webauthnRpId,
     userName: userId,
     userDisplayName: userId,
     attestationType: 'none',
@@ -36,53 +37,41 @@ async function getRegistrationOptions(userId) {
     },
   });
 
-  // Store challenge for verification
-  challenges.set(userId + ':registration', {
-    challenge: options.challenge,
-    userId,
-    type: 'registration',
-    expiresAt: Date.now() + 5 * 60 * 1000,
-  });
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  db.storeWebAuthnChallenge(userId + ':registration', options.challenge, userId, 'registration', expiresAt);
 
   return options;
 }
 
 /**
- * Verify registration response and store the new credential.
+ * Verify registration response and store the new credential in the database.
  */
 async function verifyRegistration(userId, response) {
-  const challengeData = challenges.get(userId + ':registration');
+  const challengeData = db.getWebAuthnChallenge(userId + ':registration');
   if (!challengeData) {
     return { verified: false, reason: 'No pending registration challenge' };
-  }
-
-  if (Date.now() > challengeData.expiresAt) {
-    challenges.delete(userId + ':registration');
-    return { verified: false, reason: 'Challenge expired' };
   }
 
   try {
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge: challengeData.challenge,
-      expectedOrigin: ORIGIN,
-      expectedRPID: RP_ID,
+      expectedOrigin: config.webauthnOrigin,
+      expectedRPID: config.webauthnRpId,
     });
 
     if (verification.verified && verification.registrationInfo) {
       const { credential } = verification.registrationInfo;
 
-      const existingAuths = authenticators.get(userId) || [];
-      existingAuths.push({
-        credentialID: credential.id,
-        credentialPublicKey: credential.publicKey,
-        counter: credential.counter,
-        transports: response.response?.transports || [],
-        registeredAt: new Date().toISOString(),
-      });
-      authenticators.set(userId, existingAuths);
+      db.storeWebAuthnCredential(
+        userId,
+        credential.id,
+        credential.publicKey,
+        credential.counter,
+        response.response?.transports || []
+      );
 
-      challenges.delete(userId + ':registration');
+      db.deleteWebAuthnChallenge(userId + ':registration');
 
       return {
         verified: true,
@@ -101,14 +90,14 @@ async function verifyRegistration(userId, response) {
  * Generate authentication options for passwordless login.
  */
 async function getAuthenticationOptions(userId) {
-  const userAuthenticators = authenticators.get(userId) || [];
+  const userAuthenticators = db.getWebAuthnCredentials(userId);
 
   if (userAuthenticators.length === 0) {
     return { error: 'No passkeys registered for this user' };
   }
 
   const options = await generateAuthenticationOptions({
-    rpID: RP_ID,
+    rpID: config.webauthnRpId,
     allowCredentials: userAuthenticators.map(auth => ({
       id: auth.credentialID,
       transports: auth.transports,
@@ -116,12 +105,8 @@ async function getAuthenticationOptions(userId) {
     userVerification: 'preferred',
   });
 
-  challenges.set(userId + ':authentication', {
-    challenge: options.challenge,
-    userId,
-    type: 'authentication',
-    expiresAt: Date.now() + 5 * 60 * 1000,
-  });
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  db.storeWebAuthnChallenge(userId + ':authentication', options.challenge, userId, 'authentication', expiresAt);
 
   return options;
 }
@@ -130,20 +115,13 @@ async function getAuthenticationOptions(userId) {
  * Verify authentication response for passwordless login.
  */
 async function verifyAuthentication(userId, response) {
-  const challengeData = challenges.get(userId + ':authentication');
+  const challengeData = db.getWebAuthnChallenge(userId + ':authentication');
   if (!challengeData) {
     return { verified: false, reason: 'No pending authentication challenge' };
   }
 
-  if (Date.now() > challengeData.expiresAt) {
-    challenges.delete(userId + ':authentication');
-    return { verified: false, reason: 'Challenge expired' };
-  }
-
-  const userAuthenticators = authenticators.get(userId) || [];
-  const matchingAuth = userAuthenticators.find(
-    auth => auth.credentialID === response.id
-  );
+  const userAuthenticators = db.getWebAuthnCredentials(userId);
+  const matchingAuth = userAuthenticators.find(auth => auth.credentialID === response.id);
 
   if (!matchingAuth) {
     return { verified: false, reason: 'Unknown credential' };
@@ -153,8 +131,8 @@ async function verifyAuthentication(userId, response) {
     const verification = await verifyAuthenticationResponse({
       response,
       expectedChallenge: challengeData.challenge,
-      expectedOrigin: ORIGIN,
-      expectedRPID: RP_ID,
+      expectedOrigin: config.webauthnOrigin,
+      expectedRPID: config.webauthnRpId,
       credential: {
         id: matchingAuth.credentialID,
         publicKey: matchingAuth.credentialPublicKey,
@@ -163,15 +141,9 @@ async function verifyAuthentication(userId, response) {
     });
 
     if (verification.verified) {
-      // Update counter
-      matchingAuth.counter = verification.authenticationInfo.newCounter;
-      challenges.delete(userId + ':authentication');
-
-      return {
-        verified: true,
-        userId,
-        message: 'Passwordless authentication successful',
-      };
+      db.updateWebAuthnCounter(userId, matchingAuth.credentialID, verification.authenticationInfo.newCounter);
+      db.deleteWebAuthnChallenge(userId + ':authentication');
+      return { verified: true, userId, message: 'Passwordless authentication successful' };
     }
 
     return { verified: false, reason: 'Verification failed' };
@@ -181,19 +153,17 @@ async function verifyAuthentication(userId, response) {
 }
 
 /**
- * Check if a user has registered passkeys.
+ * Check if a user has registered passkeys (from database).
  */
 function hasPasskeys(userId) {
-  const auths = authenticators.get(userId) || [];
-  return auths.length > 0;
+  return db.getWebAuthnCredentials(userId).length > 0;
 }
 
 /**
- * Get passkey count for a user.
+ * Get passkey count for a user (from database).
  */
 function getPasskeyCount(userId) {
-  const auths = authenticators.get(userId) || [];
-  return auths.length;
+  return db.getWebAuthnCredentials(userId).length;
 }
 
 module.exports = {
@@ -203,7 +173,4 @@ module.exports = {
   verifyAuthentication,
   hasPasskeys,
   getPasskeyCount,
-  RP_ID,
-  RP_NAME,
-  ORIGIN,
 };

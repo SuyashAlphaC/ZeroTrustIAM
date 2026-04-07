@@ -1,4 +1,7 @@
+'use strict';
+
 const crypto = require('crypto');
+const { logger } = require('./logger');
 
 // In-memory world state (mirrors what the real Fabric chaincode will store)
 const worldState = {
@@ -70,7 +73,7 @@ function evaluateAccess(userId, deviceId, riskScore, requiredPermission) {
 function logAndReturn(txId, userId, deviceId, riskScore, decision, reason, timestamp) {
   const entry = { txId, userId, deviceId, riskScore, decision, reason, timestamp };
   auditLog.push(entry);
-  console.log(`[BLOCKCHAIN LOG] ${decision} | ${userId} | ${reason} | txId=${txId}`);
+  logger.info({ txId, userId, decision, reason }, 'Blockchain decision logged');
   return { decision, reason, txId, layer: 'Smart Contract (mock)' };
 }
 

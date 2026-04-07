@@ -12,6 +12,8 @@ const BASE_URL = 'http://localhost:3000/api/login';
 let passed = 0;
 let failed = 0;
 
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function runTest(name, payload, expectedDecision) {
   try {
     const res = await fetch(BASE_URL, {
@@ -85,6 +87,9 @@ async function main() {
     'ALLOW'
   );
 
+  // Brief pause to avoid rate limiting
+  await delay(1000);
+
   // Scenario 2: Stolen Credentials + Unknown Device
   console.log('\n--- Scenario 2: Stolen Credentials + Unknown Device ---');
   await runTest(
@@ -112,7 +117,7 @@ async function main() {
       location: { country: 'RU', city: 'Moscow' },
       requiredPermission: 'read',
     },
-    'MFA_REQUIRED'  // l_score=1 -> R=0.30 >= step-up threshold, MFA required
+    'MFA_REQUIRED'  // l_score=1 -> R=0.30+anomaly >= step-up threshold, MFA enrolled so step-up required
   );
 
   // Scenario 4: Off-Hours Access
@@ -129,6 +134,8 @@ async function main() {
     },
     'ALLOW'  // t_score=1 -> R=0.20 < 0.6, device OK
   );
+
+  await delay(1000);
 
   // Scenario 5: Suspended Account
   console.log('\n--- Scenario 5: Suspended Account ---');

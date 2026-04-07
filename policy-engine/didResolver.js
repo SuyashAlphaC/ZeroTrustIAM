@@ -1,18 +1,16 @@
+'use strict';
+
 const crypto = require('crypto');
+const config = require('./config');
+const db = require('./database');
 
 /**
- * W3C DID Resolver for did:fabric:iam method.
- *
- * In mock mode, DIDs are stored in memory.
- * In Fabric mode, DIDs are resolved from the blockchain ledger.
+ * W3C DID Resolver for did:fabric:iam method — fully database-backed.
+ * All DID documents and Verifiable Credentials persist in SQLite.
  */
 
-// In-memory DID store (mock mode)
-const didStore = new Map();
-const vcStore = new Map();
-
 /**
- * Generate a key pair for a DID.
+ * Generate an EC P-256 key pair for a DID.
  */
 function generateKeyPair() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
@@ -20,16 +18,13 @@ function generateKeyPair() {
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
-
-  // Convert public key to JWK
   const pubKeyObj = crypto.createPublicKey(publicKey);
-  const jwk = pubKeyObj.export({ format: 'jwk' });
-
-  return { publicKey, privateKey, publicKeyJwk: jwk };
+  const publicKeyJwk = pubKeyObj.export({ format: 'jwk' });
+  return { publicKey, privateKey, publicKeyJwk };
 }
 
 /**
- * Create a DID document (mock mode).
+ * Create a DID document and persist it in the database.
  */
 function createDID(userId) {
   const did = `did:fabric:iam:${userId}`;
@@ -43,36 +38,32 @@ function createDID(userId) {
     ],
     id: did,
     controller: did,
-    verificationMethod: [
-      {
-        id: `${did}#key-1`,
-        type: 'JsonWebKey2020',
-        controller: did,
-        publicKeyJwk,
-      },
-    ],
+    verificationMethod: [{
+      id: `${did}#key-1`,
+      type: 'JsonWebKey2020',
+      controller: did,
+      publicKeyJwk,
+    }],
     authentication: [`${did}#key-1`],
     assertionMethod: [`${did}#key-1`],
-    service: [
-      {
-        id: `${did}#iam-service`,
-        type: 'ZeroTrustIAM',
-        serviceEndpoint: 'http://localhost:4000',
-      },
-    ],
+    service: [{
+      id: `${did}#iam-service`,
+      type: 'ZeroTrustIAM',
+      serviceEndpoint: config.oauthIssuer,
+    }],
     created: timestamp,
     updated: timestamp,
   };
 
-  didStore.set(did, { document: didDocument, privateKey });
+  db.storeDID(did, userId, didDocument, privateKey);
   return { did, didDocument };
 }
 
 /**
- * Resolve a DID document (mock mode).
+ * Resolve a DID document from the database.
  */
 function resolveDID(did) {
-  const entry = didStore.get(did);
+  const entry = db.getDID(did);
   if (!entry) {
     return {
       '@context': 'https://w3id.org/did-resolution/v1',
@@ -92,26 +83,23 @@ function resolveDID(did) {
     didDocumentMetadata: {
       created: entry.document.created,
       updated: entry.document.updated,
+      deactivated: entry.deactivated || false,
     },
   };
 }
 
 /**
- * Issue a Verifiable Credential (mock mode).
+ * Issue a Verifiable Credential and persist it in the database.
  */
 function issueCredential(issuerDid, subjectDid, types, claims) {
   const credentialId = `vc-${crypto.randomUUID().slice(0, 8)}`;
-
   const credential = {
     '@context': ['https://www.w3.org/2018/credentials/v1'],
     id: credentialId,
     type: ['VerifiableCredential', ...types],
     issuer: issuerDid,
     issuanceDate: new Date().toISOString(),
-    credentialSubject: {
-      id: subjectDid,
-      ...claims,
-    },
+    credentialSubject: { id: subjectDid, ...claims },
     proof: {
       type: 'BlockchainProof2024',
       created: new Date().toISOString(),
@@ -121,25 +109,25 @@ function issueCredential(issuerDid, subjectDid, types, claims) {
     },
   };
 
-  vcStore.set(credentialId, credential);
+  db.storeVC(credentialId, issuerDid, subjectDid, credential);
   return credential;
 }
 
 /**
- * Verify a Verifiable Credential (mock mode).
+ * Verify a Verifiable Credential from the database.
  */
 function verifyCredential(credentialId) {
-  const credential = vcStore.get(credentialId);
-  if (!credential) {
+  const vcRow = db.getVC(credentialId);
+  if (!vcRow) {
     return { verified: false, reason: 'Credential not found' };
   }
+  const credential = vcRow.credential;
 
-  const issuerEntry = didStore.get(credential.issuer);
+  const issuerEntry = db.getDID(credential.issuer);
   if (!issuerEntry) {
     return { verified: false, reason: 'Issuer DID not found' };
   }
-
-  if (issuerEntry.document.deactivated) {
+  if (issuerEntry.deactivated) {
     return { verified: false, reason: 'Issuer DID deactivated' };
   }
 
@@ -147,19 +135,37 @@ function verifyCredential(credentialId) {
 }
 
 /**
- * Seed DIDs for demo users.
+ * List all DIDs from the database.
+ */
+function listDIDs() {
+  return db.getAllDIDs().map(row => ({
+    did: row.did,
+    userId: row.user_id,
+    deactivated: !!row.deactivated,
+    createdAt: row.created_at,
+  }));
+}
+
+/**
+ * Seed DIDs for demo users into the database.
  */
 function seedDemoDIDs() {
+  // Only seed if not already present
+  if (db.getDID('did:fabric:iam:alice')) {
+    return {
+      alice: 'did:fabric:iam:alice',
+      bob: 'did:fabric:iam:bob',
+    };
+  }
+
   const aliceDID = createDID('alice');
   const bobDID = createDID('bob');
 
-  // Issue role credentials
   issueCredential(
     aliceDID.did, aliceDID.did,
     ['RoleCredential'],
     { role: 'admin', grantedBy: 'system', grantedAt: new Date().toISOString() }
   );
-
   issueCredential(
     aliceDID.did, bobDID.did,
     ['RoleCredential'],
@@ -174,8 +180,7 @@ module.exports = {
   resolveDID,
   issueCredential,
   verifyCredential,
+  listDIDs,
   seedDemoDIDs,
   generateKeyPair,
-  didStore,
-  vcStore,
 };

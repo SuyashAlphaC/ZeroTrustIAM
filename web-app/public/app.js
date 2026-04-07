@@ -8,69 +8,34 @@ function getDeviceId() {
   return deviceId;
 }
 
-// JWT token management
-function getAccessToken() {
-  return sessionStorage.getItem('zt-iam-access-token');
-}
-
-function getRefreshToken() {
-  return sessionStorage.getItem('zt-iam-refresh-token');
-}
-
-function storeTokens(accessToken, refreshToken) {
-  sessionStorage.setItem('zt-iam-access-token', accessToken);
-  if (refreshToken) {
-    sessionStorage.setItem('zt-iam-refresh-token', refreshToken);
-  }
-}
-
-function clearTokens() {
-  sessionStorage.removeItem('zt-iam-access-token');
-  sessionStorage.removeItem('zt-iam-refresh-token');
-}
-
 // Display device ID on page
 const deviceId = getDeviceId();
 document.getElementById('deviceIdDisplay').textContent = deviceId;
 
-// Check for existing session on page load
+// Check for existing session on page load (tokens are now in HttpOnly cookies)
 checkSession();
 
 async function checkSession() {
-  const token = getAccessToken();
-  if (!token) return;
-
   try {
-    const res = await fetch('/api/verify-token', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
+    const res = await fetch('/api/verify-token', { method: 'POST' });
     const result = await res.json();
     if (result.valid) {
       showSession(result);
     } else {
-      // Try refresh
+      // Try refresh (cookie is sent automatically)
       const refreshed = await tryRefreshToken();
-      if (!refreshed) clearTokens();
+      if (!refreshed) hideSession();
     }
   } catch {
-    clearTokens();
+    hideSession();
   }
 }
 
 async function tryRefreshToken() {
-  const refreshToken = getRefreshToken();
-  if (!refreshToken) return false;
-
   try {
-    const res = await fetch('/api/refresh-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken }),
-    });
+    const res = await fetch('/api/refresh-token', { method: 'POST' });
     if (!res.ok) return false;
-    const result = await res.json();
-    storeTokens(result.accessToken, null);
+    // New cookies are set by server
     await checkSession();
     return true;
   } catch {
@@ -94,21 +59,20 @@ function showSession(sessionInfo) {
   addRow('User', sessionInfo.user);
   addRow('Role', sessionInfo.role);
   addRow('Token Expires', new Date(sessionInfo.expiresAt).toLocaleString());
+  addRow('Session', 'Secured (HttpOnly cookie)');
   details.innerHTML = html;
+}
+
+function hideSession() {
+  document.getElementById('sessionPanel').classList.add('hidden');
 }
 
 // Handle logout
 document.getElementById('logoutBtn').addEventListener('click', async () => {
-  const refreshToken = getRefreshToken();
   try {
-    await fetch('/api/logout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken }),
-    });
+    await fetch('/api/logout', { method: 'POST' });
   } catch { /* ignore */ }
-  clearTokens();
-  document.getElementById('sessionPanel').classList.add('hidden');
+  hideSession();
 });
 
 // Handle login form submission
@@ -147,18 +111,14 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
       return;
     }
 
-    // Store JWT tokens if authentication succeeded
-    if (result.accessToken) {
-      storeTokens(result.accessToken, result.refreshToken);
+    // Session cookies are set automatically by the server
+    if (result.tokenSet) {
       checkSession();
     }
 
     displayResult(result);
   } catch (err) {
-    displayResult({
-      decision: 'DENY',
-      reason: 'Network error: ' + err.message,
-    });
+    displayResult({ decision: 'DENY', reason: 'Network error: ' + err.message });
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = 'Authenticate';
@@ -177,7 +137,6 @@ function displayResult(result) {
   banner.textContent = isAllowed ? 'ACCESS GRANTED' : 'ACCESS DENIED';
 
   let detailsHTML = '';
-
   const addRow = (label, value) => {
     detailsHTML += `<div class="detail-row">
       <span class="detail-label">${label}</span>
@@ -190,6 +149,9 @@ function displayResult(result) {
 
   if (result.riskScore !== undefined) {
     addRow('Risk Score', result.riskScore.toFixed(2));
+    if (result.baseRiskScore !== undefined && result.baseRiskScore !== result.riskScore) {
+      addRow('Base Risk', result.baseRiskScore.toFixed(2));
+    }
   }
 
   if (result.breakdown) {
@@ -199,21 +161,23 @@ function displayResult(result) {
     addRow('Attempt Score', result.breakdown.a_score);
   }
 
-  if (result.txId) {
-    addRow('Transaction ID', result.txId);
+  if (result.anomaly && result.anomaly.anomalyDetected) {
+    addRow('Anomaly', 'Detected (score: ' + result.anomaly.combined + ')');
   }
 
-  if (result.layer) {
-    addRow('Decided By', result.layer);
-  }
+  if (result.txId) addRow('Transaction ID', result.txId);
+  if (result.layer) addRow('Decided By', result.layer);
 
-  if (result.accessToken) {
-    addRow('JWT Token', 'Issued (stored in session)');
+  if (result.tokenSet) {
+    addRow('Session', 'Established (HttpOnly cookie)');
     addRow('Token Expiry', result.tokenExpiry);
   }
 
-  if (result.mfaVerified) {
-    addRow('MFA', 'Verified');
+  if (result.mfaVerified) addRow('MFA', 'Verified');
+
+  if (result.zkProof) {
+    addRow('ZK Proof', result.zkProof.proofId.slice(0, 12) + '...');
+    if (result.zkProof.experimental) addRow('ZKP Status', 'Experimental');
   }
 
   details.innerHTML = detailsHTML;
@@ -252,8 +216,7 @@ document.getElementById('mfaSubmitBtn').addEventListener('click', async () => {
     });
     const result = await response.json();
 
-    if (result.accessToken) {
-      storeTokens(result.accessToken, result.refreshToken);
+    if (result.tokenSet) {
       checkSession();
     }
 

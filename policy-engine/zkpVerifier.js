@@ -1,17 +1,32 @@
 /**
  * Zero-Knowledge Proof (ZKP) for Risk Score Verification
  *
- * Implements a Pedersen commitment-based ZKP scheme that allows
- * the policy engine to prove to the blockchain that a risk score
- * is below the threshold WITHOUT revealing the actual score.
+ * EXPERIMENTAL: This module implements a DEMONSTRATION-GRADE Pedersen
+ * commitment-based ZKP scheme. It is NOT suitable for production
+ * security-critical decisions without the following upgrades:
  *
- * Protocol:
+ * - Replace with Bulletproofs (dalek-cryptography) or Groth16 zk-SNARKs
+ * - Use audited elliptic curve groups (e.g., Curve25519) instead of
+ *   modular arithmetic with large primes
+ * - Integrate with a trusted setup ceremony for zk-SNARKs
+ * - Add formal verification of the proof system
+ *
+ * The current implementation correctly demonstrates the PROTOCOL:
  * 1. Prover (policy engine) commits to risk score: C = g^score * h^r (mod p)
  * 2. Prover creates a range proof that score < threshold
  * 3. Verifier (blockchain) checks the proof without learning the score
  *
- * This implementation uses a simplified Schnorr-like protocol
- * suitable for demonstration. In production, use Bulletproofs or zk-SNARKs.
+ * But the simplified Schnorr-like range proof does not provide the
+ * same security guarantees as Bulletproofs. Specifically, the soundness
+ * guarantee is weaker because the range decomposition is not enforced
+ * bit-by-bit as in Bulletproofs.
+ *
+ * Upgrade path: npm install bulletproofs-js (when available) or
+ * integrate with a Rust ZKP library via WASM/FFI.
+ *
+ * @module zkpVerifier
+ * @experimental
+ * @version 0.2.0-demo
  */
 
 const crypto = require('crypto');

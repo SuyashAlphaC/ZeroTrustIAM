@@ -1,12 +1,12 @@
+'use strict';
+
 const grpc = require('@grpc/grpc-js');
 const { connect, signers } = require('@hyperledger/fabric-gateway');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-
-const CHANNEL_NAME = 'iamchannel';
-const CHAINCODE_NAME = 'iam-cc';
-const MSP_ID = 'Org1MSP';
+const config = require('./config');
+const { logger } = require('./logger');
 
 // Paths to crypto material
 const NETWORK_DIR = path.resolve(__dirname, '..', 'fabric-network');
@@ -23,7 +23,7 @@ function getGrpcClient() {
   const tlsRootCert = fs.readFileSync(PEER_TLS_CERT);
   const tlsCredentials = grpc.credentials.createSsl(tlsRootCert);
 
-  grpcClient = new grpc.Client('localhost:7051', tlsCredentials, {
+  grpcClient = new grpc.Client(config.fabricPeerEndpoint, tlsCredentials, {
     'grpc.ssl_target_name_override': 'peer0.org1.example.com',
   });
 
@@ -34,7 +34,7 @@ function newIdentity() {
   const certFiles = fs.readdirSync(USER_CERT_DIR);
   const certPath = path.join(USER_CERT_DIR, certFiles[0]);
   const credentials = fs.readFileSync(certPath);
-  return { mspId: MSP_ID, credentials };
+  return { mspId: config.fabricMspId, credentials };
 }
 
 function newSigner() {
@@ -47,7 +47,6 @@ function newSigner() {
 
 /**
  * Evaluate access via the real Hyperledger Fabric smart contract.
- * Same interface as mockBlockchain.evaluateAccess().
  */
 async function evaluateAccess(userId, deviceId, riskScore, requiredPermission) {
   const client = getGrpcClient();
@@ -62,19 +61,15 @@ async function evaluateAccess(userId, deviceId, riskScore, requiredPermission) {
   });
 
   try {
-    const network = gateway.getNetwork(CHANNEL_NAME);
-    const contract = network.getContract(CHAINCODE_NAME);
+    const network = gateway.getNetwork(config.fabricChannelName);
+    const contract = network.getContract(config.fabricChaincodeName);
 
     const resultBytes = await contract.submitTransaction(
-      'EvaluateAccess',
-      userId,
-      deviceId,
-      String(riskScore),
-      requiredPermission
+      'EvaluateAccess', userId, deviceId, String(riskScore), requiredPermission
     );
 
     const result = JSON.parse(Buffer.from(resultBytes).toString());
-    console.log(`[BLOCKCHAIN] ${result.decision} | ${userId} | ${result.reason} | txId=${result.txId}`);
+    logger.info({ txId: result.txId, userId, decision: result.decision, reason: result.reason }, 'Fabric blockchain decision');
 
     return {
       decision: result.decision,
@@ -100,8 +95,8 @@ async function getAuditLog() {
   });
 
   try {
-    const network = gateway.getNetwork(CHANNEL_NAME);
-    const contract = network.getContract(CHAINCODE_NAME);
+    const network = gateway.getNetwork(config.fabricChannelName);
+    const contract = network.getContract(config.fabricChaincodeName);
     const resultBytes = await contract.evaluateTransaction('GetAllAuditLogs');
     return JSON.parse(Buffer.from(resultBytes).toString());
   } finally {
