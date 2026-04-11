@@ -15,6 +15,8 @@ const mfa = require('./mfa');
 const didResolver = require('./didResolver');
 const webauthn = require('./webauthn');
 const anomalyDetector = require('./anomalyDetector');
+const { scoreWithML, mlHealth } = require('./mlRiskScorer');
+const { computeEnsembleRisk } = require('./riskScorerEnsemble');
 const zkp = require('./zkpVerifier');
 
 const blockchain = config.useMock
@@ -124,11 +126,44 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
 
     const { score: baseRiskScore, breakdown } = computeRiskScore(userProfile, requestContext);
 
-    // Step 2b: ML anomaly detection adjustment
-    const anomalyResult = anomalyDetector.adjustRiskScore(baseRiskScore, username, requestContext);
-    const riskScore = anomalyResult.adjustedRiskScore;
+    // Step 2b: behavioral anomaly detection (still needed for explanations + recordLogin downstream)
+    const anomaly = anomalyDetector.detectAnomalies(username, requestContext);
+    const anomalyScore = anomaly.combined;
 
-    req.log.info({ username, baseRiskScore, riskScore, anomalyAdj: anomalyResult.anomalyAdjustment, breakdown }, 'Risk score computed');
+    // Step 2c: ML sidecar — RandomForest data-driven score
+    const profile = anomalyDetector.getProfileSummary(username);
+    const mlResult = await scoreWithML(userProfile, requestContext, {
+      requiredPermission: requiredPermission || 'read',
+      failedAttempts: Math.round((breakdown.a_score || 0) * 5),
+      knownLocations: profile.knownLocations,
+      knownDevices: profile.knownDevices,
+      loginHoursMean: profile.loginHours.mean,
+      loginHoursStd: profile.loginHours.std,
+      profileSamples: profile.loginHours.samples,
+      lastLogin: profile.lastLogin,
+    });
+
+    // Step 2d: ensemble blend
+    const ensemble = computeEnsembleRisk({ ahpScore: baseRiskScore, mlResult, anomalyScore });
+    const riskScore = ensemble.ensembleScore;
+
+    // Preserve legacy shape expected by the /evaluate response + downstream code
+    const anomalyResult = {
+      originalRiskScore: baseRiskScore,
+      adjustedRiskScore: riskScore,
+      anomalyAdjustment: Math.round((riskScore - baseRiskScore) * 100) / 100,
+      anomaly,
+    };
+
+    req.log.info({
+      username,
+      baseRiskScore,
+      riskScore,
+      ensemble: ensemble.components,
+      weights: ensemble.weights,
+      mlAvailable: ensemble.mlAvailable,
+      breakdown,
+    }, 'Risk score computed');
 
     // Step 3: Policy engine threshold check
     if (riskScore >= config.riskThreshold) {
@@ -139,7 +174,8 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: 'DENY', reason: 'Risk too high', layer: 'Policy Engine' });
       return res.json({
         decision: 'DENY', reason: `Risk score too high (${riskScore} >= ${config.riskThreshold})`,
-        riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly, layer: 'Policy Engine', txId: blockchainResult.txId,
+        riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly, ensemble,
+        layer: 'Policy Engine', txId: blockchainResult.txId,
       });
     }
 
@@ -204,7 +240,7 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       req.log.info({ username, txId: blockchainResult.txId }, 'Access granted');
       return res.json({
         decision: 'ALLOW', reason: blockchainResult.reason,
-        riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly,
+        riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly, ensemble,
         txId: blockchainResult.txId, layer: blockchainResult.layer,
         accessToken, refreshToken, tokenExpiry: config.jwtAccessExpiry,
         mfaVerified: stepUpRequired ? true : undefined, zkProof,
@@ -218,7 +254,7 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
     req.log.info({ username, decision: blockchainResult.decision, reason: blockchainResult.reason }, 'Blockchain decision');
     res.json({
       decision: blockchainResult.decision, reason: blockchainResult.reason,
-      riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly,
+      riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly, ensemble,
       txId: blockchainResult.txId, layer: blockchainResult.layer,
     });
   } catch (err) {
@@ -376,6 +412,10 @@ app.post('/zkp/verify', validate('zkpVerify'), (req, res) => {
 // ──────────────────────── Anomaly Detection ────────────────────────
 
 app.get('/anomaly/profile/:username', (req, res) => res.json(anomalyDetector.getProfileSummary(req.params.username)));
+
+app.get('/ml/health', async (req, res) => {
+  res.json(await mlHealth());
+});
 
 app.post('/anomaly/detect', validate('anomalyDetect'), (req, res) => {
   const context = { username: req.body.username, deviceId: req.body.deviceId || 'unknown', timestamp: req.body.timestamp || new Date().toISOString(), location: req.body.location || { country: 'UNKNOWN', city: 'UNKNOWN' } };

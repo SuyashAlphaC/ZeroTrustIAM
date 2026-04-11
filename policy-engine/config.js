@@ -91,6 +91,16 @@ const config = {
   // ZKP
   zkpEnabled: process.env.ZKP_ENABLED !== 'false',
   zkpExperimental: true,
+
+  // ML risk scoring sidecar (Python FastAPI)
+  mlServiceEnabled: process.env.ML_SERVICE_ENABLED !== 'false',
+  mlServiceUrl: process.env.ML_SERVICE_URL || 'http://localhost:5000',
+  mlServiceTimeoutMs: parseInt(process.env.ML_SERVICE_TIMEOUT_MS || '800', 10),
+
+  // Ensemble weights: AHP + ML + anomaly (must sum to 1)
+  ensembleAhpWeight: parseFloat(process.env.ENSEMBLE_AHP_WEIGHT || '0.4'),
+  ensembleMlWeight: parseFloat(process.env.ENSEMBLE_ML_WEIGHT || '0.4'),
+  ensembleAnomalyWeight: parseFloat(process.env.ENSEMBLE_ANOMALY_WEIGHT || '0.2'),
 };
 
 module.exports = config;
