@@ -624,8 +624,9 @@ ZeroTrustIAM/
 │   ├── oauth.js                          # OAuth 2.0 / OIDC (RS256 keys DB-persisted)
 │   ├── webauthn.js                       # WebAuthn/FIDO2 passkey management (DB-backed)
 │   ├── didResolver.js                    # W3C DID resolver + Verifiable Credentials (DB-backed)
-│   ├── fabricClient.js                   # Hyperledger Fabric Gateway SDK client
-│   ├── mockBlockchain.js                 # In-memory mock (USE_MOCK=true)
+│   ├── fabricClient.js                   # Hyperledger Fabric Gateway SDK client (sole blockchain path)
+│   ├── mlRiskScorer.js                   # HTTP client for Python RF sidecar
+│   ├── riskScorerEnsemble.js             # AHP + RF + anomaly weighted blend w/ graceful fallback
 │   ├── .env.example                      # Reference environment config with all variables
 │   ├── jest.config.js                    # Jest test configuration (ESM compatibility)
 │   ├── package.json                      # bcrypt, jsonwebtoken, otplib, better-sqlite3, etc.
@@ -635,9 +636,10 @@ ZeroTrustIAM/
 │       │   ├── anomalyDetector.test.js   # Anomaly detection unit tests (DB-backed)
 │       │   ├── zkpVerifier.test.js       # ZKP proof generation/verification tests
 │       │   ├── database.test.js          # Database CRUD and constraint tests
-│       │   └── mockBlockchain.test.js    # Mock blockchain unit tests
+│       │   ├── mlRiskScorer.test.js      # ML sidecar HTTP client tests (fetch mocked)
+│       │   └── riskScorerEnsemble.test.js # Ensemble blend + graceful fallback tests
 │       └── integration/
-│           └── api.test.js               # Full API integration tests (supertest)
+│           └── api.test.js               # Full API integration tests (fabricClient mocked via jest.mock)
 │
 ├── chaincode/                            # Hyperledger Fabric smart contract
 │   ├── Dockerfile                        # Node.js Alpine image for CCaaS
@@ -660,8 +662,18 @@ ZeroTrustIAM/
 │       ├── deploy-chaincode.sh           # Package, install, approve, commit chaincode
 │       └── teardown.sh                   # Stop containers, clean up
 │
+├── ml-service/                           # Python FastAPI Random Forest risk-scoring sidecar
+│   ├── app.py                            # FastAPI: /health, /model/info, /predict, /model/reload
+│   ├── features.py                       # 17-feature Pydantic schema + extractor
+│   ├── model.py                          # RandomForestRiskModel (train/predict/explain/save/load)
+│   ├── synthetic_generator.py            # 5 attack profiles + benign training data
+│   ├── public_loader.py                  # Optional RBA dataset loader
+│   ├── train.py                          # CLI trainer
+│   ├── requirements.txt                  # FastAPI, scikit-learn, pandas, joblib
+│   └── Dockerfile                        # Container image w/ pre-trained model
+│
 └── test/
-    ├── test-phase1.sh                    # cURL-based tests (mock blockchain)
+    ├── test-phase1.sh                    # cURL-based smoke tests against live Fabric
     └── attack-scenarios.js               # 7 attack scenarios, 12 tests
 ```
 
@@ -698,8 +710,12 @@ The `.env` file controls all runtime behavior. Key variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NODE_ENV` | `development` | Set to `production` for production mode |
-| `USE_MOCK` | `true` | `true` = in-memory mock blockchain, `false` = real Fabric |
 | `SEED_DEMO` | `true` | Seeds `alice`/`bob` test users. **Never set in production** |
+| `ML_SERVICE_ENABLED` | `true` | Toggle the Random Forest sidecar in the ensemble |
+| `ML_SERVICE_URL` | `http://localhost:5000` | Base URL of the Python RF sidecar |
+| `ENSEMBLE_AHP_WEIGHT` | `0.4` | AHP contribution (0..1) |
+| `ENSEMBLE_ML_WEIGHT` | `0.4` | RF contribution (redistributed if sidecar down) |
+| `ENSEMBLE_ANOMALY_WEIGHT` | `0.2` | Anomaly-detector contribution |
 | `JWT_SECRET` | auto-generated | **REQUIRED in production** -- HMAC key for access tokens |
 | `JWT_REFRESH_SECRET` | auto-generated | **REQUIRED in production** -- HMAC key for refresh tokens |
 | `OAUTH_DEFAULT_CLIENT_SECRET` | auto-generated | **REQUIRED in production** -- OAuth client secret |
@@ -709,16 +725,26 @@ The `.env` file controls all runtime behavior. Key variables:
 
 See `.env.example` for the complete list of 30+ configurable variables (risk weights, rate limits, Fabric connection, WebAuthn, MFA, etc.).
 
-### 9.2 Development Mode (Mock Blockchain, No Docker)
+### 9.2 Development Mode (Live Fabric + ML Sidecar)
 
-The fastest way to run the system locally without Hyperledger Fabric:
+The system always runs against a real Hyperledger Fabric network — the mock
+blockchain path has been removed. Bring up Fabric first (see §9.3), then run
+the services:
 
 ```bash
-# Terminal 1: Policy Engine (mock blockchain + demo users)
-cd policy-engine
-USE_MOCK=true SEED_DEMO=true node server.js
+# Terminal 1: ML Random Forest sidecar
+cd ml-service
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python train.py --n-synthetic 10000 --model-dir ./models
+MODEL_DIR=./models uvicorn app:app --host 0.0.0.0 --port 5000
 
-# Terminal 2: Web App
+# Terminal 2: Policy Engine (connects to live Fabric + ML sidecar)
+cd policy-engine
+JWT_SECRET=devsecret JWT_REFRESH_SECRET=devrefresh \
+OAUTH_DEFAULT_CLIENT_SECRET=devclient SEED_DEMO=true node server.js
+
+# Terminal 3: Web App
 cd web-app
 node server.js
 ```
@@ -777,7 +803,6 @@ export OAUTH_DEFAULT_CLIENT_SECRET=$(node -e "console.log(require('crypto').rand
 
 # Production settings
 export NODE_ENV=production
-export USE_MOCK=false
 # SEED_DEMO is NOT set -- no demo users in production
 ```
 
@@ -801,25 +826,30 @@ OAUTH_CLIENT_SECRET=$OAUTH_DEFAULT_CLIENT_SECRET node server.js
 cd policy-engine
 
 # Run all tests (unit + integration)
-SEED_DEMO=true USE_MOCK=true npm test
+SEED_DEMO=true npm test
 
 # Unit tests only
-SEED_DEMO=true USE_MOCK=true npm run test:unit
+SEED_DEMO=true npm run test:unit
 
 # Integration tests only (starts server on random port)
-SEED_DEMO=true USE_MOCK=true npm run test:integration
+SEED_DEMO=true npm run test:integration
 ```
 
+The Jest test suite mocks `fabricClient` via `jest.mock()` so unit and
+integration tests do not require a live Fabric peer — the live-chain path
+is exercised separately by `test/attack-scenarios.js` and `test/test-phase1.sh`.
+
 The test suite includes:
-- **Unit tests**: risk scoring, anomaly detection, ZKP proofs, database CRUD, mock blockchain
-- **Integration tests**: full API endpoint testing with supertest (auth flows, token management, MFA, OAuth, DIDs)
+- **Unit tests**: AHP risk scoring, RF ensemble blend, ML HTTP client, anomaly detection, ZKP proofs, database CRUD
+- **Integration tests**: full API endpoint testing with supertest (auth flows, token management, MFA, OAuth, DIDs) — `fabricClient` mocked
 
 #### Run E2E Attack Simulations
 
 ```bash
-# Start the server first
+# Start the server first (requires live Fabric network — see §9.3)
 cd policy-engine
-SEED_DEMO=true USE_MOCK=true node server.js &
+JWT_SECRET=devsecret JWT_REFRESH_SECRET=devrefresh \
+OAUTH_DEFAULT_CLIENT_SECRET=devclient SEED_DEMO=true node server.js &
 
 # Run 7 attack scenarios (12 total tests)
 node test/attack-scenarios.js
@@ -1070,7 +1100,7 @@ Every request passes through the following middleware chain (defined in `middlew
 
 | Layer | Count | Tool | What It Covers |
 |-------|-------|------|----------------|
-| Unit | ~85 | Jest | Risk scoring, anomaly detection, ZKP proofs, database CRUD, mock blockchain |
+| Unit | ~90 | Jest | AHP risk scoring, RF ensemble blend, ML HTTP client, anomaly detection, ZKP proofs, database CRUD |
 | Integration | ~6 | Jest + supertest | Full API flows (auth, tokens, MFA, OAuth, DIDs) with isolated test DB |
 | E2E | 12 | Node.js + fetch | 7 attack scenarios against a running server |
 

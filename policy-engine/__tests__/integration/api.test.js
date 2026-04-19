@@ -7,12 +7,45 @@ const os = require('os');
 // Setup test database before requiring any app modules
 const TEST_DB_DIR = path.join(os.tmpdir(), `zt-iam-api-test-${Date.now()}`);
 process.env.DB_PATH = path.join(TEST_DB_DIR, 'test.db');
-process.env.USE_MOCK = 'true';
 process.env.SEED_DEMO = 'true';
 process.env.PORT = '0'; // random available port
 process.env.RATE_LIMIT_MAX = '200';
 process.env.RATE_LIMIT_AUTH_MAX = '200';
 process.env.LOG_LEVEL = 'silent';
+process.env.ML_SERVICE_ENABLED = 'false';
+
+// Mock the Fabric client so unit/integration tests don't require a live peer.
+// The live-chain path is validated separately by the end-to-end smoke test.
+jest.mock('../../fabricClient', () => {
+  const crypto = require('crypto');
+  const users = {
+    alice: { userId: 'alice', role: 'admin', registeredDevices: ['dev-001'], status: 'ACTIVE' },
+    bob: { userId: 'bob', role: 'viewer', registeredDevices: ['dev-002'], status: 'ACTIVE' },
+  };
+  const rolePerms = { admin: ['read', 'write', 'delete', 'manage'], viewer: ['read'] };
+  const auditLog = [];
+
+  return {
+    evaluateAccess: jest.fn(async (userId, deviceId, riskScore, requiredPermission) => {
+      const txId = crypto.randomBytes(16).toString('hex');
+      const user = users[userId];
+      const decide = (decision, reason) => {
+        auditLog.push({ txId, userId, deviceId, riskScore, decision, reason, timestamp: new Date().toISOString() });
+        return { decision, reason, txId, layer: 'Smart Contract (Hyperledger Fabric)' };
+      };
+      if (!user) return decide('DENY', 'User not found');
+      if (user.status !== 'ACTIVE') return decide('DENY', 'Account suspended');
+      if (!user.registeredDevices.includes(deviceId)) return decide('DENY', 'Unregistered device');
+      const score = parseFloat(riskScore);
+      if (score >= 0.6) return decide('DENY', `Risk score ${score} exceeds threshold`);
+      if (!rolePerms[user.role].includes(requiredPermission)) {
+        return decide('DENY', `Role ${user.role} lacks permission ${requiredPermission}`);
+      }
+      return decide('ALLOW', 'All policy checks passed');
+    }),
+    getAuditLog: jest.fn(async () => auditLog.slice()),
+  };
+});
 
 const request = require('supertest');
 const { app, start } = require('../../server');
@@ -45,7 +78,7 @@ describe('API Integration Tests', () => {
       const res = await request(app).get('/health');
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('healthy');
-      expect(res.body.blockchain).toBe('mock');
+      expect(res.body.blockchain).toBe('fabric');
       expect(res.body.database).toBe('connected');
     });
   });

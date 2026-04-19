@@ -1,0 +1,96 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App-stack compose for Zero Trust IAM.
+#
+# Brings up the three user-facing services:
+#   web-app (3000) → policy-engine (4000) → ml-service (5000)
+#
+# The Hyperledger Fabric network lives in its own compose file at
+# fabric-network/docker-compose.yaml because its lifecycle (cryptogen, channel
+# creation, chaincode install/commit) is different from the app services.
+# Bring Fabric up first with scripts/setup-network.sh + deploy-chaincode.sh,
+# then `docker compose up -d` from this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  ztiam:
+    driver: bridge
+  fabric_net:
+    external: true
+    name: fabric-network_fabric-network
+
+volumes:
+  policy_engine_data:
+  ml_service_models:
+
+services:
+  ml-service:
+    build:
+      context: ./ml-service
+    container_name: ztiam-ml-service
+    environment:
+      MODEL_DIR: /app/models
+      ML_DATASET_PATH: /app/models/training_samples.db
+      ML_RETRAIN_INTERVAL_MINUTES: "30"
+      ML_RETRAIN_MIN_NEW_SAMPLES: "50"
+      ML_RETRAIN_SYNTHETIC_SAMPLES: "5000"
+    volumes:
+      - ml_service_models:/app/models
+    networks:
+      - ztiam
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  policy-engine:
+    build:
+      context: ./policy-engine
+    container_name: ztiam-policy-engine
+    depends_on:
+      ml-service:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DB_PATH: /app/data/iam.db
+      LOG_LEVEL: info
+      ML_SERVICE_ENABLED: "true"
+      ML_SERVICE_URL: http://ml-service:5000
+      ML_SERVICE_TIMEOUT_MS: "1500"
+      ZKP_ENABLED: "true"
+      # Fabric
+      FABRIC_CHANNEL: iamchannel
+      FABRIC_CHAINCODE: iam-cc
+      FABRIC_MSP_ID: Org1MSP
+      FABRIC_PEER_ENDPOINT: peer0.org1.example.com:7051
+      # Required secrets — override with real values for production deploys.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-change-me}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-only-refresh-secret-change-me}
+      OAUTH_DEFAULT_CLIENT_SECRET: ${OAUTH_DEFAULT_CLIENT_SECRET:-dev-only-client-secret}
+      SEED_DEMO: ${SEED_DEMO:-false}
+    volumes:
+      - policy_engine_data:/app/data
+      - ./fabric-network/organizations:/app/fabric-network/organizations:ro
+    networks:
+      - ztiam
+      - fabric_net
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+
+  web-app:
+    build:
+      context: ./web-app
+    container_name: ztiam-web-app
+    depends_on:
+      policy-engine:
+        condition: service_healthy
+    environment:
+      PORT: "3000"
+      POLICY_ENGINE_URL: http://policy-engine:4000
+    networks:
+      - ztiam
+    ports:
+      - "3000:3000"
+    restart: unless-stopped

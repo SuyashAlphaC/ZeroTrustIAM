@@ -25,7 +25,6 @@ const config = {
   // Server
   port: parseInt(process.env.PORT || '4000', 10),
   nodeEnv: process.env.NODE_ENV || 'development',
-  useMock: process.env.USE_MOCK === 'true',
   seedDemo: process.env.SEED_DEMO === 'true', // only seed demo data when explicitly requested
 
   // Database

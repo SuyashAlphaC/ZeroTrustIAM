@@ -94,6 +94,63 @@ async function scoreWithML(userProfile, requestContext, opts = {}) {
   }
 }
 
+/**
+ * Derive a training label from the observed decision and reason.
+ *
+ * Maps the 4-rule chaincode outcomes to supervised labels:
+ *  - ALLOW                                       -> benign (0)
+ *  - DENY (Unregistered device, Risk too high,
+ *          Suspended, RBAC lack, wrong password) -> attack (1)
+ *  - MFA_REQUIRED + verified downstream          -> benign (0)
+ *
+ * The soft "benign" signal from successful logins isn't perfect but gives the
+ * model a growing baseline of real legitimate traffic; paired with synthetic
+ * attack coverage the RF stays well-calibrated.
+ */
+function deriveLabel(decision, reason) {
+  if (decision === 'ALLOW' || decision === 'MFA_REQUIRED') return 0;
+  if (decision === 'DENY') return 1;
+  return null;
+}
+
+/**
+ * Fire-and-forget: push a labeled feature vector to the sidecar so it's stored
+ * for the next scheduled retrain. Failures are logged but never surfaced to
+ * the caller — label ingestion is strictly best-effort.
+ */
+function ingestSample(userProfile, requestContext, opts = {}) {
+  if (!config.mlServiceEnabled) return;
+  const label = opts.label ?? deriveLabel(opts.decision, opts.reason);
+  if (label === null || label === undefined) return;
+
+  const body = {
+    risk_request: toRiskRequest(userProfile, requestContext, opts),
+    label,
+    source: opts.source || 'live',
+    username: requestContext.username,
+    decision: opts.decision,
+    reason: opts.reason,
+  };
+
+  // Fire-and-forget — use a generous timeout but never await from the handler.
+  fetchWithTimeout(
+    `${config.mlServiceUrl}/ingest`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    config.mlServiceTimeoutMs * 2
+  ).then(async (res) => {
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      logger.warn({ status: res.status, text }, 'ML ingest non-OK');
+    }
+  }).catch((err) => {
+    logger.debug({ err: err.message }, 'ML ingest failed (non-fatal)');
+  });
+}
+
 async function mlHealth() {
   if (!config.mlServiceEnabled) return { enabled: false };
   try {
@@ -108,4 +165,4 @@ async function mlHealth() {
   }
 }
 
-module.exports = { scoreWithML, mlHealth, toRiskRequest };
+module.exports = { scoreWithML, mlHealth, toRiskRequest, ingestSample, deriveLabel };

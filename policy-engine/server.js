@@ -15,13 +15,12 @@ const mfa = require('./mfa');
 const didResolver = require('./didResolver');
 const webauthn = require('./webauthn');
 const anomalyDetector = require('./anomalyDetector');
-const { scoreWithML, mlHealth } = require('./mlRiskScorer');
+const { scoreWithML, mlHealth, ingestSample } = require('./mlRiskScorer');
 const { computeEnsembleRisk } = require('./riskScorerEnsemble');
 const zkp = require('./zkpVerifier');
+const promMetrics = require('./metrics');
 
-const blockchain = config.useMock
-  ? require('./mockBlockchain')
-  : require('./fabricClient');
+const blockchain = require('./fabricClient');
 
 const app = express();
 
@@ -30,6 +29,7 @@ const app = express();
 app.use(securityHeaders);
 app.use(express.json({ limit: '100kb' }));
 app.use(requestLogger);
+app.use(promMetrics.httpMetricsMiddleware);
 app.use(globalLimiter);
 app.disable('x-powered-by');
 
@@ -76,6 +76,13 @@ function generateRefreshToken(username) {
   return token;
 }
 
+// ──────────────────────── Observability ────────────────────────
+
+app.get('/metrics', (req, res) => {
+  res.set('Content-Type', 'text/plain; version=0.0.4');
+  res.send(promMetrics.renderText());
+});
+
 // ──────────────────────── Health Check ────────────────────────
 
 app.get('/health', (req, res) => {
@@ -85,7 +92,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     version: '2.0.0',
-    blockchain: config.useMock ? 'mock' : 'fabric',
+    blockchain: 'fabric',
     database: dbOk ? 'connected' : 'disconnected',
   });
 });
@@ -104,6 +111,7 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       incrementFailedAttempts(username);
       req.log.warn({ username }, 'User not found');
       db.writeAuditLog({ userId: username, deviceId, decision: 'DENY', reason: 'User not found', layer: 'Policy Engine' });
+      promMetrics.inc('ztiam_decisions_total', { decision: 'DENY', layer: 'policy_engine', reason: 'user_not_found' });
       return res.json({ decision: 'DENY', reason: 'Invalid credentials - user not found', layer: 'Policy Engine' });
     }
 
@@ -112,6 +120,7 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       const attempts = incrementFailedAttempts(username);
       req.log.warn({ username, attempts }, 'Invalid password');
       db.writeAuditLog({ userId: username, deviceId, decision: 'DENY', reason: 'Wrong password', layer: 'Policy Engine' });
+      promMetrics.inc('ztiam_decisions_total', { decision: 'DENY', layer: 'policy_engine', reason: 'wrong_password' });
       return res.json({ decision: 'DENY', reason: 'Invalid credentials - wrong password', failedAttempts: attempts, layer: 'Policy Engine' });
     }
 
@@ -172,6 +181,20 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       anomalyDetector.recordLogin(username, requestContext);
       db.recordLoginHistory(username, deviceId, location?.country, location?.city, requestContext.timestamp, riskScore, 'DENY');
       db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: 'DENY', reason: 'Risk too high', layer: 'Policy Engine' });
+      ingestSample(userProfile, requestContext, {
+        requiredPermission: requiredPermission || 'read',
+        failedAttempts: Math.round((breakdown.a_score || 0) * 5),
+        knownLocations: profile.knownLocations,
+        knownDevices: profile.knownDevices,
+        loginHoursMean: profile.loginHours.mean,
+        loginHoursStd: profile.loginHours.std,
+        profileSamples: profile.loginHours.samples,
+        lastLogin: profile.lastLogin,
+        decision: 'DENY',
+        reason: 'Risk too high',
+      });
+      promMetrics.inc('ztiam_decisions_total', { decision: 'DENY', layer: 'policy_engine', reason: 'risk_too_high' });
+      promMetrics.inc('ztiam_ml_ingest_total', { label: '1' });
       return res.json({
         decision: 'DENY', reason: `Risk score too high (${riskScore} >= ${config.riskThreshold})`,
         riskScore, baseRiskScore, breakdown, anomaly: anomalyResult.anomaly, ensemble,
@@ -237,6 +260,21 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
 
       db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: 'ALLOW', reason: blockchainResult.reason, layer: blockchainResult.layer });
 
+      ingestSample(userProfile, requestContext, {
+        requiredPermission: requiredPermission || 'read',
+        failedAttempts: Math.round((breakdown.a_score || 0) * 5),
+        knownLocations: profile.knownLocations,
+        knownDevices: profile.knownDevices,
+        loginHoursMean: profile.loginHours.mean,
+        loginHoursStd: profile.loginHours.std,
+        profileSamples: profile.loginHours.samples,
+        lastLogin: profile.lastLogin,
+        decision: 'ALLOW',
+        reason: blockchainResult.reason,
+      });
+      promMetrics.inc('ztiam_decisions_total', { decision: 'ALLOW', layer: 'chaincode' });
+      promMetrics.inc('ztiam_ml_ingest_total', { label: '0' });
+
       req.log.info({ username, txId: blockchainResult.txId }, 'Access granted');
       return res.json({
         decision: 'ALLOW', reason: blockchainResult.reason,
@@ -250,6 +288,21 @@ app.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
     // Blockchain denied
     db.recordLoginHistory(username, deviceId, location?.country, location?.city, requestContext.timestamp, riskScore, blockchainResult.decision);
     db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: blockchainResult.decision, reason: blockchainResult.reason, layer: blockchainResult.layer });
+
+    ingestSample(userProfile, requestContext, {
+      requiredPermission: requiredPermission || 'read',
+      failedAttempts: Math.round((breakdown.a_score || 0) * 5),
+      knownLocations: profile.knownLocations,
+      knownDevices: profile.knownDevices,
+      loginHoursMean: profile.loginHours.mean,
+      loginHoursStd: profile.loginHours.std,
+      profileSamples: profile.loginHours.samples,
+      lastLogin: profile.lastLogin,
+      decision: blockchainResult.decision,
+      reason: blockchainResult.reason,
+    });
+    promMetrics.inc('ztiam_decisions_total', { decision: blockchainResult.decision, layer: 'chaincode' });
+    promMetrics.inc('ztiam_ml_ingest_total', { label: blockchainResult.decision === 'DENY' ? '1' : '0' });
 
     req.log.info({ username, decision: blockchainResult.decision, reason: blockchainResult.reason }, 'Blockchain decision');
     res.json({
@@ -568,7 +621,7 @@ function start() {
   const server = app.listen(config.port, () => {
     logger.info({
       port: config.port,
-      blockchain: config.useMock ? 'MOCK' : 'Hyperledger Fabric',
+      blockchain: 'Hyperledger Fabric',
       riskThreshold: config.riskThreshold,
       mfaStepUp: config.mfaStepUpThreshold,
       zkp: config.zkpEnabled ? 'enabled (experimental)' : 'disabled',
