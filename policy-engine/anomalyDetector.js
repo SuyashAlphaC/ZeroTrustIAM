@@ -16,7 +16,7 @@ const db = require('./database');
  * Each factor produces an anomaly score [0, 1].
  * Combined anomaly score adjusts the risk score additively.
  *
- * All behavioral profiles persist in SQLite via the anomaly_profiles table.
+ * All behavioral profiles persist in PostgreSQL via the anomaly_profiles table.
  *
  * @module anomalyDetector
  * @version 2.0.0
@@ -37,15 +37,15 @@ const SIGNAL_WEIGHTS = {
  * Get a user's behavioral profile from the database.
  * Creates a default profile if none exists.
  */
-function getProfile(userId) {
+async function getProfile(userId) {
   return db.getAnomalyProfile(userId);
 }
 
 /**
  * Record a login event and update the behavioral model in the database.
  */
-function recordLogin(userId, context) {
-  const profile = getProfile(userId);
+async function recordLogin(userId, context) {
+  const profile = await getProfile(userId);
   const timestamp = new Date(context.timestamp);
   const hour = timestamp.getHours() + timestamp.getMinutes() / 60;
 
@@ -83,15 +83,15 @@ function recordLogin(userId, context) {
   };
 
   // Persist to database
-  db.updateAnomalyProfile(userId, profile);
+  await db.updateAnomalyProfile(userId, profile);
 }
 
 /**
  * Compute anomaly scores for a login attempt.
  * All profile data is read from the database.
  */
-function detectAnomalies(userId, context) {
-  const profile = getProfile(userId);
+async function detectAnomalies(userId, context) {
+  const profile = await getProfile(userId);
   const timestamp = new Date(context.timestamp);
   const hour = timestamp.getHours() + timestamp.getMinutes() / 60;
   const scores = {};
@@ -116,7 +116,7 @@ function detectAnomalies(userId, context) {
   }
 
   // 3. Login frequency (check recent logins from DB)
-  const recentLogins = db.getRecentLogins(userId, 5); // last 5 minutes
+  const recentLogins = await db.getRecentLogins(userId, 5);
   const recentCount = recentLogins.length;
   scores.frequencyAnomaly = Math.min(recentCount / 10, 1);
 
@@ -154,6 +154,12 @@ function detectAnomalies(userId, context) {
   }
   combined = Math.round(combined * 100) / 100;
 
+  const mature = profile.loginHours.samples >= config.anomalyColdStartMinSamples;
+  let effectiveThreshold = config.anomalyThreshold;
+  if (!mature) {
+    effectiveThreshold = Math.min(1, effectiveThreshold + config.anomalyColdStartEpsilon);
+  }
+
   // Human-readable explanations
   const explanations = [];
   if (scores.timeAnomaly > 0.3) explanations.push(`Login time deviates ${(scores.timeAnomaly * 3).toFixed(1)} std devs from usual pattern`);
@@ -165,7 +171,9 @@ function detectAnomalies(userId, context) {
   return {
     scores,
     combined,
-    anomalyDetected: combined >= config.anomalyThreshold,
+    anomalyDetected: combined >= effectiveThreshold,
+    coldStart: !mature,
+    anomalyThresholdEffective: effectiveThreshold,
     profileMaturity: profile.loginHours.samples,
     modelVersion: MODEL_VERSION,
     explanation: explanations.length > 0 ? explanations : ['No anomalies detected'],
@@ -175,8 +183,8 @@ function detectAnomalies(userId, context) {
 /**
  * Adjust risk score based on anomaly detection.
  */
-function adjustRiskScore(originalRiskScore, userId, context) {
-  const anomaly = detectAnomalies(userId, context);
+async function adjustRiskScore(originalRiskScore, userId, context) {
+  const anomaly = await detectAnomalies(userId, context);
   const adjustment = anomaly.combined * config.anomalyWeight;
   const adjustedScore = Math.min(Math.round((originalRiskScore + adjustment) * 100) / 100, 1);
 
@@ -191,8 +199,8 @@ function adjustRiskScore(originalRiskScore, userId, context) {
 /**
  * Get behavioral profile summary from the database.
  */
-function getProfileSummary(userId) {
-  const profile = getProfile(userId);
+async function getProfileSummary(userId) {
+  const profile = await getProfile(userId);
   return {
     userId,
     loginHours: {
@@ -209,7 +217,7 @@ function getProfileSummary(userId) {
 /**
  * Seed behavioral profiles for demo users via database.
  */
-function seedDemoProfiles() {
+async function seedDemoProfiles() {
   const aliceLogins = [
     { timestamp: '2026-04-01T09:30:00Z', location: { country: 'IN', city: 'Gwalior' }, deviceId: 'dev-001' },
     { timestamp: '2026-04-01T10:15:00Z', location: { country: 'IN', city: 'Gwalior' }, deviceId: 'dev-001' },
@@ -217,7 +225,7 @@ function seedDemoProfiles() {
     { timestamp: '2026-04-02T09:00:00Z', location: { country: 'IN', city: 'Gwalior' }, deviceId: 'dev-001' },
     { timestamp: '2026-04-02T11:30:00Z', location: { country: 'IN', city: 'Gwalior' }, deviceId: 'dev-001' },
   ];
-  for (const login of aliceLogins) recordLogin('alice', login);
+  for (const login of aliceLogins) await recordLogin('alice', login);
 
   const bobLogins = [
     { timestamp: '2026-04-01T10:00:00Z', location: { country: 'IN', city: 'Delhi' }, deviceId: 'dev-002' },
@@ -225,7 +233,7 @@ function seedDemoProfiles() {
     { timestamp: '2026-04-02T09:30:00Z', location: { country: 'IN', city: 'Delhi' }, deviceId: 'dev-002' },
     { timestamp: '2026-04-02T14:00:00Z', location: { country: 'IN', city: 'Delhi' }, deviceId: 'dev-002' },
   ];
-  for (const login of bobLogins) recordLogin('bob', login);
+  for (const login of bobLogins) await recordLogin('bob', login);
 }
 
 /**
@@ -237,6 +245,10 @@ function getModelDiagnostics() {
     weights: SIGNAL_WEIGHTS,
     anomalyWeight: config.anomalyWeight,
     detectionThreshold: config.anomalyThreshold,
+    coldStart: {
+      minSamples: config.anomalyColdStartMinSamples,
+      epsilon: config.anomalyColdStartEpsilon,
+    },
   };
 }
 

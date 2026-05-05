@@ -1,0 +1,15 @@
+# Apply: kubectl apply -k k8s/
+# Override images and secrets before production use.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ztiam
+resources:
+  - base/namespace.yaml
+  - base/secrets-placeholder.yaml
+  - base/configmap-policy-engine.yaml
+  - base/postgres.yaml
+  - base/ml-service.yaml
+  - base/policy-engine.yaml
+  - base/web-app.yaml
+  - base/hpa.yaml
+  - base/ingress.yaml

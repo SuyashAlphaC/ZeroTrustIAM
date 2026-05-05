@@ -1,13 +1,102 @@
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const https = require('https');
 
 const app = express();
-const PORT = process.env.WEB_PORT || 3000;
-const POLICY_ENGINE_URL = process.env.POLICY_ENGINE_URL || 'http://localhost:4000';
+const PORT = process.env.WEB_PORT || process.env.PORT || 3000;
+/** Issuer/policy base URL reachable from the user's browser (OAuth redirects). */
+const POLICY_ENGINE_PUBLIC_URL = process.env.POLICY_ENGINE_URL || 'http://localhost:4000';
+/** Base URL used by this server's outbound calls to the policy-engine (often the Docker network host). */
+const POLICY_ENGINE_INTERNAL_URL = process.env.POLICY_ENGINE_INTERNAL_URL || POLICY_ENGINE_PUBLIC_URL;
+
+let policyHttpsAgent;
+function outboundPolicyAgentOptions() {
+  if (!String(POLICY_ENGINE_INTERNAL_URL).startsWith('https://')) return {};
+  const ca = process.env.POLICY_ENGINE_TLS_CA_PATH;
+  const cert = process.env.POLICY_ENGINE_MTLS_CERT_PATH;
+  const key = process.env.POLICY_ENGINE_MTLS_KEY_PATH;
+  if (!ca || !cert || !key) {
+    throw new Error(
+      'POLICY_ENGINE_INTERNAL_URL uses https:// but POLICY_ENGINE_TLS_CA_PATH, POLICY_ENGINE_MTLS_CERT_PATH, and POLICY_ENGINE_MTLS_KEY_PATH must all be set'
+    );
+  }
+  if (!policyHttpsAgent) {
+    policyHttpsAgent = new https.Agent({
+      ca: fs.readFileSync(ca),
+      cert: fs.readFileSync(cert),
+      key: fs.readFileSync(key),
+      minVersion: 'TLSv1.2',
+      keepAlive: true,
+    });
+  }
+  return { agent: policyHttpsAgent };
+}
+
+async function policyFetch(pathOrUrl, opts = {}) {
+  const url = /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${POLICY_ENGINE_INTERNAL_URL}${pathOrUrl}`;
+  const agentOpts = outboundPolicyAgentOptions();
+  return fetch(url, { ...agentOpts, ...opts });
+}
+
 const OAUTH_CALLBACK_URL = process.env.OAUTH_CALLBACK_URL || `http://localhost:${PORT}/oauth/callback`;
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'zt-iam-web';
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || process.env.OAUTH_DEFAULT_CLIENT_SECRET || 'change-me-in-production';
+
+if ((process.env.NODE_ENV || '').toLowerCase() === 'production') {
+  app.set('trust proxy', Number(process.env.WEB_TRUST_PROXY_HOPS || 1));
+}
+
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
+const Tokens = require('csrf');
+
+const csrfProtect = new Tokens();
+
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false,
+}));
+app.use(cookieParser());
+app.use(rateLimit({
+  windowMs: parseInt(process.env.WEB_RATE_LIMIT_WINDOW_MS || '60000', 10),
+  max: parseInt(process.env.WEB_RATE_LIMIT_MAX || '200', 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+app.get('/api/csrf-token', (req, res) => {
+  const secret = csrfProtect.secretSync();
+  res.cookie('_csrf', secret, {
+    httpOnly: true,
+    sameSite: 'strict',
+    path: '/',
+    secure: process.env.WEB_CSRF_SECURE === 'true'
+      || (process.env.NODE_ENV || '').toLowerCase() === 'production',
+  });
+  res.json({ csrfToken: csrfProtect.create(secret) });
+});
+
+const CSRF_EXEMPT_PREFIXES = new Set([
+  '/csrf-token',
+]);
+
+app.use('/api', (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  let sub = req.originalUrl.replace(/^\/api/, '') || '/';
+  sub = sub.split('?')[0];
+  for (const prefix of CSRF_EXEMPT_PREFIXES) {
+    if (sub === prefix || sub.startsWith(`${prefix}/`)) return next();
+  }
+  const secret = req.cookies._csrf;
+  const token = req.headers['x-csrf-token'];
+  if (!secret || !token || !csrfProtect.verify(secret, token)) {
+    return res.status(403).json({ error: 'Invalid CSRF token', code: 'CSRF_REJECTED' });
+  }
+  return next();
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -57,7 +146,7 @@ app.use((req, res, next) => {
 
 app.post('/api/login', async (req, res) => {
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/evaluate`, {
+    const response = await policyFetch('/evaluate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
@@ -86,7 +175,7 @@ app.post('/api/verify-token', async (req, res) => {
   if (!token) return res.status(401).json({ valid: false, reason: 'No session' });
 
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/verify-token`, {
+    const response = await policyFetch('/verify-token', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` },
     });
@@ -104,7 +193,7 @@ app.post('/api/refresh-token', async (req, res) => {
   if (!refreshToken) return res.status(401).json({ error: 'No refresh token' });
 
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/refresh-token`, {
+    const response = await policyFetch('/refresh-token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refreshToken }),
@@ -125,7 +214,7 @@ app.post('/api/refresh-token', async (req, res) => {
 app.post('/api/logout', async (req, res) => {
   const refreshToken = req.cookies?.zt_refresh;
   try {
-    await fetch(`${POLICY_ENGINE_URL}/logout`, {
+    await policyFetch('/logout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refreshToken }),
@@ -146,7 +235,7 @@ const webauthnPaths = [
 for (const wpath of webauthnPaths) {
   app.post(`/api${wpath}`, async (req, res) => {
     try {
-      const response = await fetch(`${POLICY_ENGINE_URL}${wpath}`, {
+      const response = await policyFetch(wpath, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req.body),
@@ -166,7 +255,7 @@ for (const wpath of webauthnPaths) {
 
 app.get('/api/webauthn/status/:username', async (req, res) => {
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/webauthn/status/${req.params.username}`);
+    const response = await policyFetch(`/webauthn/status/${req.params.username}`);
     res.json(await response.json());
   } catch (err) {
     res.status(502).json({ error: 'Policy engine unavailable' });
@@ -177,7 +266,7 @@ app.get('/api/webauthn/status/:username', async (req, res) => {
 
 app.post('/api/mfa/enroll', async (req, res) => {
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/mfa/enroll`, {
+    const response = await policyFetch('/mfa/enroll', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
@@ -190,7 +279,7 @@ app.post('/api/mfa/enroll', async (req, res) => {
 
 app.post('/api/mfa/challenge', async (req, res) => {
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/mfa/challenge`, {
+    const response = await policyFetch('/mfa/challenge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
@@ -209,7 +298,7 @@ app.post('/api/mfa/challenge', async (req, res) => {
 
 app.get('/api/mfa/status/:username', async (req, res) => {
   try {
-    const response = await fetch(`${POLICY_ENGINE_URL}/mfa/status/${req.params.username}`);
+    const response = await policyFetch(`/mfa/status/${req.params.username}`);
     res.json(await response.json());
   } catch (err) {
     res.status(502).json({ error: 'Policy engine unavailable' });
@@ -224,7 +313,7 @@ app.get('/oauth/callback', async (req, res) => {
   if (!code) return res.status(400).send('No authorization code received');
 
   try {
-    const tokenRes = await fetch(`${POLICY_ENGINE_URL}/oauth/token`, {
+    const tokenRes = await policyFetch('/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -250,7 +339,7 @@ app.get('/oauth/callback', async (req, res) => {
 app.get('/oauth/login', (req, res) => {
   const state = crypto.randomUUID();
   const nonce = crypto.randomUUID();
-  const authUrl = `${POLICY_ENGINE_URL}/oauth/authorize?response_type=code&client_id=${OAUTH_CLIENT_ID}&redirect_uri=${encodeURIComponent(OAUTH_CALLBACK_URL)}&scope=openid%20profile&state=${state}&nonce=${nonce}`;
+  const authUrl = `${POLICY_ENGINE_PUBLIC_URL}/oauth/authorize?response_type=code&client_id=${OAUTH_CLIENT_ID}&redirect_uri=${encodeURIComponent(OAUTH_CALLBACK_URL)}&scope=openid%20profile&state=${state}&nonce=${nonce}`;
   res.redirect(authUrl);
 });
 

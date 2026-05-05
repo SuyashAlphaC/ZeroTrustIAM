@@ -18,13 +18,32 @@ networks:
     driver: bridge
   fabric_net:
     external: true
-    name: fabric-network_fabric-network
+    name: fabric_iam
 
 volumes:
-  policy_engine_data:
   ml_service_models:
+  postgres_data:
+  grafana_data:
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ztiam-postgres
+    environment:
+      POSTGRES_DB: ztiam
+      POSTGRES_USER: ztiam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ztiam
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ztiam"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   ml-service:
     build:
       context: ./ml-service
@@ -34,13 +53,11 @@ services:
       ML_DATASET_PATH: /app/models/training_samples.db
       ML_RETRAIN_INTERVAL_MINUTES: "30"
       ML_RETRAIN_MIN_NEW_SAMPLES: "50"
-      ML_RETRAIN_SYNTHETIC_SAMPLES: "5000"
+      ML_SERVICE_TOKEN: ${ML_SERVICE_TOKEN:?ML_SERVICE_TOKEN is required}
     volumes:
       - ml_service_models:/app/models
     networks:
       - ztiam
-    ports:
-      - "5000:5000"
     restart: unless-stopped
 
   policy-engine:
@@ -48,35 +65,56 @@ services:
       context: ./policy-engine
     container_name: ztiam-policy-engine
     depends_on:
+      postgres:
+        condition: service_healthy
       ml-service:
         condition: service_healthy
     environment:
       NODE_ENV: production
       PORT: "4000"
-      DB_PATH: /app/data/iam.db
+      DATABASE_URL: postgresql://ztiam:${POSTGRES_PASSWORD}@postgres:5432/ztiam
       LOG_LEVEL: info
       ML_SERVICE_ENABLED: "true"
       ML_SERVICE_URL: http://ml-service:5000
       ML_SERVICE_TIMEOUT_MS: "1500"
+      ML_SERVICE_TOKEN: ${ML_SERVICE_TOKEN:?ML_SERVICE_TOKEN is required}
+      TLS_ENABLED: "true"
+      TLS_KEY_PATH: /app/certs/internal/policy-engine-key.pem
+      TLS_CERT_PATH: /app/certs/internal/policy-engine.pem
+      MTLS_CA_PATH: /app/certs/internal/ca.pem
+      OAUTH_ISSUER: https://localhost:4000
       ZKP_ENABLED: "true"
-      # Fabric
       FABRIC_CHANNEL: iamchannel
       FABRIC_CHAINCODE: iam-cc
       FABRIC_MSP_ID: Org1MSP
       FABRIC_PEER_ENDPOINT: peer0.org1.example.com:7051
-      # Required secrets — override with real values for production deploys.
-      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-change-me}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-only-refresh-secret-change-me}
-      OAUTH_DEFAULT_CLIENT_SECRET: ${OAUTH_DEFAULT_CLIENT_SECRET:-dev-only-client-secret}
+      FABRIC_PEER_ENDPOINT_ORG2: peer0.org2.example.com:7051
+      FABRIC_NETWORK_DIR: /app/fabric-network
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      OAUTH_DEFAULT_CLIENT_SECRET: ${OAUTH_DEFAULT_CLIENT_SECRET:?OAUTH_DEFAULT_CLIENT_SECRET is required}
       SEED_DEMO: ${SEED_DEMO:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-zt-iam-policy-engine}
     volumes:
-      - policy_engine_data:/app/data
       - ./fabric-network/organizations:/app/fabric-network/organizations:ro
+      - ./certs/internal:/app/certs/internal:ro
     networks:
       - ztiam
       - fabric_net
     ports:
       - "4000:4000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf --cacert /app/certs/internal/ca.pem --cert /app/certs/internal/web-client.pem --key /app/certs/internal/web-client-key.pem https://127.0.0.1:4000/health >/dev/null || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
     restart: unless-stopped
 
   web-app:
@@ -88,9 +126,73 @@ services:
         condition: service_healthy
     environment:
       PORT: "3000"
-      POLICY_ENGINE_URL: http://policy-engine:4000
+      POLICY_ENGINE_URL: https://localhost:4000
+      POLICY_ENGINE_INTERNAL_URL: https://policy-engine:4000
+      POLICY_ENGINE_TLS_CA_PATH: /app/certs/internal/ca.pem
+      POLICY_ENGINE_MTLS_CERT_PATH: /app/certs/internal/web-client.pem
+      POLICY_ENGINE_MTLS_KEY_PATH: /app/certs/internal/web-client-key.pem
+      NODE_ENV: production
+      WEB_CSRF_SECURE: "false"
     networks:
       - ztiam
+    volumes:
+      - ./certs/internal:/app/certs/internal:ro
     ports:
       - "3000:3000"
     restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.53
+    profiles: ["obs"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    networks:
+      - ztiam
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    profiles: ["obs"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - ztiam
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    profiles: ["obs"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - ztiam
+
+  vault:
+    image: hashicorp/vault:1.17
+    profiles: ["vault-dev"]
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-devroot}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    networks:
+      - ztiam

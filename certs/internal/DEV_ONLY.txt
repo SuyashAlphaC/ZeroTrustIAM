@@ -1,0 +1,2 @@
+ZTiam development-only PKCS material (do not reuse in production).
+Generate replacements with openssl or your PKI and store private keys outside git.

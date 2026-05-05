@@ -12,12 +12,42 @@ function getDeviceId() {
 const deviceId = getDeviceId();
 document.getElementById('deviceIdDisplay').textContent = deviceId;
 
+let csrfTokenMemo = null;
+
+async function getCsrfToken() {
+  if (csrfTokenMemo) return csrfTokenMemo;
+  const r = await fetch('/api/csrf-token', { credentials: 'same-origin' });
+  if (!r.ok) throw new Error('CSRF bootstrap failed');
+  const d = await r.json();
+  csrfTokenMemo = d.csrfToken;
+  return csrfTokenMemo;
+}
+
+async function apiPostEmpty(url) {
+  const csrf = await getCsrfToken();
+  return fetch(url, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrf },
+  });
+}
+
+async function apiPostJson(url, obj) {
+  const csrf = await getCsrfToken();
+  return fetch(url, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    body: JSON.stringify(obj),
+  });
+}
+
 // Check for existing session on page load (tokens are now in HttpOnly cookies)
 checkSession();
 
 async function checkSession() {
   try {
-    const res = await fetch('/api/verify-token', { method: 'POST' });
+    const res = await apiPostEmpty('/api/verify-token');
     const result = await res.json();
     if (result.valid) {
       showSession(result);
@@ -33,7 +63,7 @@ async function checkSession() {
 
 async function tryRefreshToken() {
   try {
-    const res = await fetch('/api/refresh-token', { method: 'POST' });
+    const res = await apiPostJson('/api/refresh-token', {});
     if (!res.ok) return false;
     // New cookies are set by server
     await checkSession();
@@ -70,7 +100,7 @@ function hideSession() {
 // Handle logout
 document.getElementById('logoutBtn').addEventListener('click', async () => {
   try {
-    await fetch('/api/logout', { method: 'POST' });
+    await apiPostJson('/api/logout', {});
   } catch { /* ignore */ }
   hideSession();
 });
@@ -97,11 +127,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
   };
 
   try {
-    const response = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const response = await apiPostJson('/api/login', payload);
 
     const result = await response.json();
 
@@ -209,11 +235,7 @@ document.getElementById('mfaSubmitBtn').addEventListener('click', async () => {
   btn.textContent = 'Verifying...';
 
   try {
-    const response = await fetch('/api/mfa/challenge', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ challengeId: pendingChallengeId, code }),
-    });
+    const response = await apiPostJson('/api/mfa/challenge', { challengeId: pendingChallengeId, code });
     const result = await response.json();
 
     if (result.tokenSet) {

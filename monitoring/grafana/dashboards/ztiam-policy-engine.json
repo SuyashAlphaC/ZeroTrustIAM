@@ -1,0 +1,103 @@
+{
+  "title": "ZeroTrustIAM — Policy Engine",
+  "uid": "ztiam-pe",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "tags": ["ztiam", "policy-engine"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Request Rate (req/s)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "rate(http_requests_total{job=\"policy-engine\"}[5m])", "legendFormat": "req/s" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Error Rate",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.01 }, { "color": "red", "value": 0.05 }] } } },
+      "targets": [{
+        "expr": "rate(http_requests_total{job=\"policy-engine\",status=~\"5..\"}[5m]) / rate(http_requests_total{job=\"policy-engine\"}[5m])",
+        "legendFormat": "5xx rate"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "p99 Latency",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 2 }] } } },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{job=\"policy-engine\"}[5m]))",
+        "legendFormat": "p99"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Active Pods",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "count(up{job=\"policy-engine\"} == 1)", "legendFormat": "pods" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Rate by Status",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "rate(http_requests_total{job=\"policy-engine\",status=~\"2..\"}[5m])", "legendFormat": "2xx" },
+        { "expr": "rate(http_requests_total{job=\"policy-engine\",status=~\"4..\"}[5m])", "legendFormat": "4xx" },
+        { "expr": "rate(http_requests_total{job=\"policy-engine\",status=~\"5..\"}[5m])", "legendFormat": "5xx" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Latency Percentiles",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{job=\"policy-engine\"}[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job=\"policy-engine\"}[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{job=\"policy-engine\"}[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Access Decisions",
+      "description": "ALLOW vs DENY vs STEP_UP decisions over time",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "rate(ztiam_access_decision_total{decision=\"ALLOW\"}[5m])", "legendFormat": "ALLOW/s" },
+        { "expr": "rate(ztiam_access_decision_total{decision=\"DENY\"}[5m])", "legendFormat": "DENY/s" },
+        { "expr": "rate(ztiam_access_decision_total{decision=\"STEP_UP\"}[5m])", "legendFormat": "STEP_UP/s" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Risk Score Distribution",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ztiam_risk_score_bucket[5m]))", "legendFormat": "p50 risk" },
+        { "expr": "histogram_quantile(0.95, rate(ztiam_risk_score_bucket[5m]))", "legendFormat": "p95 risk" },
+        { "expr": "histogram_quantile(0.99, rate(ztiam_risk_score_bucket[5m]))", "legendFormat": "p99 risk" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Fabric Chaincode Calls",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "rate(fabric_chaincode_invocation_total[5m])", "legendFormat": "calls/s" },
+        { "expr": "rate(fabric_chaincode_invocation_errors_total[5m])", "legendFormat": "errors/s" }
+      ]
+    }
+  ]
+}

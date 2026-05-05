@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 1 Tests - Web App + Policy Engine (Mock Blockchain)
+# Phase 1 Tests - Web App + Policy Engine (Real Hyperledger Fabric)
 # Requires both servers running: web-app (:3000) and policy-engine (:4000)
 
 BASE_URL="http://localhost:3000/api/login"

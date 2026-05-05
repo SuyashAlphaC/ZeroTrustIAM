@@ -2,10 +2,8 @@
 SQLite-backed store for real labeled login samples.
 
 Each row captures one ingested feature vector with a derived or observed label
-(0 = benign, 1 = attack). The training pipeline concatenates this store with
-synthetic data so the Random Forest progressively learns from production
-traffic while retaining coverage of attack profiles that may be rare in the
-wild.
+(0 = benign, 1 = attack). The training pipeline consumes only this live store
+so the Random Forest learns from observed production traffic.
 """
 
 from __future__ import annotations
@@ -24,6 +22,7 @@ from features import FEATURE_NAMES
 
 
 DEFAULT_DB_PATH = os.environ.get("ML_DATASET_PATH", "./models/training_samples.db")
+ML_MAX_FEATURE_L2 = float(os.environ.get("ML_MAX_FEATURE_L2", "25"))
 
 
 _SCHEMA = """
@@ -92,6 +91,12 @@ class TrainingDataset:
             )
         if label not in (0, 1):
             raise ValueError("label must be 0 or 1")
+        arr = np.asarray(features, dtype=np.float64)
+        l2 = float(np.linalg.norm(arr))
+        if l2 > ML_MAX_FEATURE_L2:
+            raise ValueError(
+                f"feature L2 norm {l2:.2f} exceeds ML_MAX_FEATURE_L2={ML_MAX_FEATURE_L2} (possible poisoning)"
+            )
         payload = json.dumps([float(v) for v in features])
         ts = datetime.utcnow().isoformat() + "Z"
         with self._lock, self._connect() as conn:

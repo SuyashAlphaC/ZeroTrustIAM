@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: ztiam
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: ztiam/web-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: WEB_CSRF_SECURE
+              value: "false"
+            - name: POLICY_ENGINE_INTERNAL_URL
+              value: https://policy-engine:4000
+            - name: POLICY_ENGINE_URL
+              value: https://changeme.example.com
+            # Mount TLS bundle via Secret in real clusters; placeholders only.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+  namespace: ztiam
+spec:
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    app: web-app

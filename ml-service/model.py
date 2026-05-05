@@ -91,7 +91,7 @@ class RandomForestRiskModel:
         }
         self.meta.n_samples = int(X.shape[0])
         self.meta.trained_at = datetime.utcnow().isoformat() + "Z"
-        self.meta.training_sources = sources or ["synthetic"]
+        self.meta.training_sources = sources or ["live"]
         self.meta.metrics = metrics
         return metrics
 

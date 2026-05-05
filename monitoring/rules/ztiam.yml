@@ -1,0 +1,102 @@
+groups:
+  - name: ztiam-recording
+    rules:
+      - record: job:ml_predict_total:rate5m
+        expr: rate(ml_predict_total[5m])
+      - record: job:ml_predict_error_total:rate5m
+        expr: rate(ml_predict_error_total[5m])
+
+  - name: ztiam-ml-alerts
+    rules:
+      - alert: MlModelNotLoaded
+        expr: ml_model_loaded == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "ML risk model not loaded"
+          description: "The Random Forest risk model has not been loaded for 5+ minutes. Access decisions fall back to AHP-only scoring."
+
+      - alert: MlPredictErrorRateHigh
+        expr: |
+          rate(ml_predict_error_total[5m])
+          / (rate(ml_predict_total[5m]) + rate(ml_predict_error_total[5m]) + 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "ML prediction error rate > 5%"
+          description: "{{ $value | humanizePercentage }} of ML prediction requests are failing."
+
+      - alert: MlRetrainFailing
+        expr: increase(ml_retrain_error_total[1h]) > 2
+        for: 0m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "ML retraining failed multiple times in the last hour"
+          description: "{{ $value }} retrain failures recorded in the past hour."
+
+      - alert: MlTrainingDataLow
+        expr: ml_training_samples_total < 100
+        for: 1h
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Fewer than 100 labeled training samples"
+          description: "Only {{ $value }} samples in dataset. ML model accuracy may be low."
+
+  - name: ztiam-policy-engine-alerts
+    rules:
+      - alert: PolicyEngineDown
+        expr: up{job="policy-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Policy engine instance down"
+          description: "policy-engine instance {{ $labels.instance }} has been unreachable for more than 1 minute."
+
+      - alert: PolicyEngineHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket{job="policy-engine"}[5m])
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Policy engine p99 latency > 2s"
+          description: "p99 latency is {{ $value | humanizeDuration }} on {{ $labels.instance }}."
+
+      - alert: PolicyEngineErrorRateHigh
+        expr: |
+          rate(http_requests_total{job="policy-engine",status=~"5.."}[5m])
+          / rate(http_requests_total{job="policy-engine"}[5m])
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Policy engine HTTP 5xx rate > 1%"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors."
+
+  - name: ztiam-fabric-alerts
+    rules:
+      - alert: FabricAuditBacklogGrowing
+        expr: increase(fabric_chaincode_invocation_errors_total[10m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Fabric chaincode invocation errors spiking"
+          description: "{{ $value }} chaincode errors in the last 10 minutes. Audit trail may be incomplete."

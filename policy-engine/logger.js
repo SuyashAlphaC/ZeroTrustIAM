@@ -2,11 +2,12 @@
 
 const pino = require('pino');
 const crypto = require('crypto');
-const config = require('./config');
 
 const isJest = typeof process.env.JEST_WORKER_ID !== 'undefined';
-const loggerLevel = isJest && process.env.ENABLE_TEST_LOGS !== 'true' ? 'silent' : config.logLevel;
-const usePrettyTransport = config.nodeEnv === 'development' && !isJest && loggerLevel !== 'silent';
+const nodeEnv = process.env.NODE_ENV || 'development';
+const envLogLevel = process.env.LOG_LEVEL || 'info';
+const loggerLevel = isJest && process.env.ENABLE_TEST_LOGS !== 'true' ? 'silent' : envLogLevel;
+const usePrettyTransport = nodeEnv === 'development' && !isJest && loggerLevel !== 'silent';
 
 const logger = pino({
   level: loggerLevel,

@@ -10,7 +10,7 @@ const db = require('./database');
 // ──────────────────────── Helmet (security headers) ────────────────────────
 
 const securityHeaders = helmet({
-  contentSecurityPolicy: config.nodeEnv === 'production' ? undefined : false,
+  contentSecurityPolicy: (process.env.NODE_ENV || 'development') === 'production' ? undefined : false,
   crossOriginEmbedderPolicy: false,
 });
 
@@ -45,20 +45,21 @@ function requireAuth(req, res, next) {
   }
 
   const token = authHeader.split(' ')[1];
-  try {
-    const jwtKey = db.getActiveSigningKey('jwt');
+  db.getActiveSigningKey('jwt').then((jwtKey) => {
     if (!jwtKey) {
       return res.status(500).json({ error: 'Server configuration error' });
     }
-    const decoded = jwt.verify(token, jwtKey.private_key, { issuer: config.jwtIssuer });
-    if (decoded.type !== 'access') {
-      return res.status(401).json({ error: 'Invalid token type', code: 'INVALID_TOKEN_TYPE' });
+    try {
+      const decoded = jwt.verify(token, jwtKey.private_key, { issuer: config.jwtIssuer });
+      if (decoded.type !== 'access') {
+        return res.status(401).json({ error: 'Invalid token type', code: 'INVALID_TOKEN_TYPE' });
+      }
+      req.user = decoded;
+      next();
+    } catch (_err) {
+      return res.status(401).json({ error: 'Token expired or invalid', code: 'INVALID_TOKEN' });
     }
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Token expired or invalid', code: 'INVALID_TOKEN' });
-  }
+  }).catch(next);
 }
 
 /**
@@ -91,6 +92,7 @@ const schemas = {
       country: Joi.string().max(10).required(),
       city: Joi.string().max(100).required(),
     }).optional(),
+    resource: Joi.string().max(200).optional(),
     requiredPermission: Joi.string().valid('read', 'write', 'delete', 'manage').optional(),
     mfaCode: Joi.string().length(6).pattern(/^[0-9]+$/).optional(),
   }),
@@ -151,6 +153,43 @@ const schemas = {
   // POST /zkp/verify
   zkpVerify: Joi.object({
     proof: Joi.object().required(),
+  }),
+
+  // POST /access-grants/verify
+  verifyAccessGrant: Joi.object({
+    grantId: Joi.string().hex().length(64).required(),
+    subject: Joi.string().alphanum().min(2).max(50).optional(),
+    resource: Joi.string().max(200).optional(),
+    permission: Joi.string().valid('read', 'write', 'delete', 'manage').optional(),
+  }),
+
+  // POST /admin/access-grants/revoke
+  revokeAccessGrant: Joi.object({
+    grantId: Joi.string().hex().length(64).required(),
+    reason: Joi.string().max(200).optional(),
+  }),
+
+  // POST /admin/policy/public-params
+  updatePolicyPublicParams: Joi.object({
+    policyId: Joi.string().max(100).optional(),
+    policyVersion: Joi.string().max(40).optional(),
+    riskThreshold: Joi.number().min(0.01).max(1).optional(),
+    zkpScheme: Joi.string().valid('PedersenBitRangeProof').optional(),
+    zkpRequiredForAllow: Joi.boolean().optional(),
+    accessGrantTtlSeconds: Joi.number().integer().min(30).max(86400).optional(),
+    authorizedRiskEngines: Joi.array().items(Joi.string().max(100)).optional(),
+    authorizedAuditors: Joi.array().items(Joi.string().max(100)).optional(),
+    activeModelVersion: Joi.string().max(100).optional(),
+    roleSchemaVersion: Joi.string().max(100).optional(),
+  }).min(1),
+
+  // POST /admin/risk-models
+  registerRiskModel: Joi.object({
+    modelVersion: Joi.string().max(100).required(),
+    modelHash: Joi.string().max(200).required(),
+    modelType: Joi.string().max(100).optional(),
+    approvedBy: Joi.string().max(100).optional(),
+    activate: Joi.boolean().optional(),
   }),
 
   // POST /anomaly/detect

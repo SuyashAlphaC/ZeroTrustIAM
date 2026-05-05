@@ -19,7 +19,7 @@ const db = require('./database');
  * Generate registration options for a user to register a new passkey.
  */
 async function getRegistrationOptions(userId) {
-  const userAuthenticators = db.getWebAuthnCredentials(userId);
+  const userAuthenticators = await db.getWebAuthnCredentials(userId);
 
   const options = await generateRegistrationOptions({
     rpName: config.webauthnRpName,
@@ -38,7 +38,7 @@ async function getRegistrationOptions(userId) {
   });
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  db.storeWebAuthnChallenge(userId + ':registration', options.challenge, userId, 'registration', expiresAt);
+  await db.storeWebAuthnChallenge(userId + ':registration', options.challenge, userId, 'registration', expiresAt);
 
   return options;
 }
@@ -47,7 +47,7 @@ async function getRegistrationOptions(userId) {
  * Verify registration response and store the new credential in the database.
  */
 async function verifyRegistration(userId, response) {
-  const challengeData = db.getWebAuthnChallenge(userId + ':registration');
+  const challengeData = await db.getWebAuthnChallenge(userId + ':registration');
   if (!challengeData) {
     return { verified: false, reason: 'No pending registration challenge' };
   }
@@ -63,7 +63,7 @@ async function verifyRegistration(userId, response) {
     if (verification.verified && verification.registrationInfo) {
       const { credential } = verification.registrationInfo;
 
-      db.storeWebAuthnCredential(
+      await db.storeWebAuthnCredential(
         userId,
         credential.id,
         credential.publicKey,
@@ -71,7 +71,7 @@ async function verifyRegistration(userId, response) {
         response.response?.transports || []
       );
 
-      db.deleteWebAuthnChallenge(userId + ':registration');
+      await db.deleteWebAuthnChallenge(userId + ':registration');
 
       return {
         verified: true,
@@ -90,7 +90,7 @@ async function verifyRegistration(userId, response) {
  * Generate authentication options for passwordless login.
  */
 async function getAuthenticationOptions(userId) {
-  const userAuthenticators = db.getWebAuthnCredentials(userId);
+  const userAuthenticators = await db.getWebAuthnCredentials(userId);
 
   if (userAuthenticators.length === 0) {
     return { error: 'No passkeys registered for this user' };
@@ -106,7 +106,7 @@ async function getAuthenticationOptions(userId) {
   });
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  db.storeWebAuthnChallenge(userId + ':authentication', options.challenge, userId, 'authentication', expiresAt);
+  await db.storeWebAuthnChallenge(userId + ':authentication', options.challenge, userId, 'authentication', expiresAt);
 
   return options;
 }
@@ -115,12 +115,12 @@ async function getAuthenticationOptions(userId) {
  * Verify authentication response for passwordless login.
  */
 async function verifyAuthentication(userId, response) {
-  const challengeData = db.getWebAuthnChallenge(userId + ':authentication');
+  const challengeData = await db.getWebAuthnChallenge(userId + ':authentication');
   if (!challengeData) {
     return { verified: false, reason: 'No pending authentication challenge' };
   }
 
-  const userAuthenticators = db.getWebAuthnCredentials(userId);
+  const userAuthenticators = await db.getWebAuthnCredentials(userId);
   const matchingAuth = userAuthenticators.find(auth => auth.credentialID === response.id);
 
   if (!matchingAuth) {
@@ -141,8 +141,8 @@ async function verifyAuthentication(userId, response) {
     });
 
     if (verification.verified) {
-      db.updateWebAuthnCounter(userId, matchingAuth.credentialID, verification.authenticationInfo.newCounter);
-      db.deleteWebAuthnChallenge(userId + ':authentication');
+      await db.updateWebAuthnCounter(userId, matchingAuth.credentialID, verification.authenticationInfo.newCounter);
+      await db.deleteWebAuthnChallenge(userId + ':authentication');
       return { verified: true, userId, message: 'Passwordless authentication successful' };
     }
 
@@ -155,15 +155,14 @@ async function verifyAuthentication(userId, response) {
 /**
  * Check if a user has registered passkeys (from database).
  */
-function hasPasskeys(userId) {
-  return db.getWebAuthnCredentials(userId).length > 0;
+async function hasPasskeys(userId) {
+  const creds = await db.getWebAuthnCredentials(userId);
+  return creds.length > 0;
 }
 
-/**
- * Get passkey count for a user (from database).
- */
-function getPasskeyCount(userId) {
-  return db.getWebAuthnCredentials(userId).length;
+async function getPasskeyCount(userId) {
+  const creds = await db.getWebAuthnCredentials(userId);
+  return creds.length;
 }
 
 module.exports = {

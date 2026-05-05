@@ -37,17 +37,17 @@
 
 1. **Single-org deployment**: The current Fabric network has one organization (Org1MSP). A real deployment would require multi-org governance with independent endorsement policies.
 
-2. **Mock mode bypass**: When `USE_MOCK=true`, the blockchain layer is simulated in-memory. This is for development only and provides no immutability or decentralization guarantees.
+2. **Real-Fabric dependency**: The policy engine now depends on the real Hyperledger Fabric client path for authorization decisions. If Fabric is unavailable, access evaluation fails closed rather than falling back to an in-memory mock.
 
 3. **ZKP is experimental**: The Pedersen commitment range proof is a demonstration of the protocol, not a production-grade implementation. It should not be relied upon for security-critical decisions. See `zkpVerifier.js` header for upgrade path.
 
 4. **Anomaly detector cold-start**: With fewer than 3 login samples, the time anomaly detector returns 0 (no anomaly). An attacker who acts during the cold-start window will not trigger time-based anomaly detection.
 
-5. **In-memory WebAuthn credentials**: Passkey credentials are stored in-memory in the webauthn module. A server restart loses all registered passkeys. Production requires persistent storage.
+5. **Persistent WebAuthn credentials**: Passkey credentials and challenges are stored in SQLite, so they survive process restarts. Database compromise still exposes registration metadata unless the underlying filesystem and backups are protected.
 
 6. **Clock synchronization**: TOTP MFA requires that the server and user's authenticator app have synchronized clocks (within 30-second tolerance). NTP should be configured on the server.
 
-7. **No HSM/KMS**: JWT signing keys are generated at startup and stored in SQLite. In production, use AWS KMS, HashiCorp Vault, or an HSM for key management.
+7. **No external HSM/KMS**: JWT/OAuth signing keys and DID private keys are encrypted before being stored in SQLite using an application master key. This is stronger than plaintext-at-rest, but production deployments should still prefer AWS KMS, HashiCorp Vault, or an HSM for key management.
 
 ## Attack Surface
 

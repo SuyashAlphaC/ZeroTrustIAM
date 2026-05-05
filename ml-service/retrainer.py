@@ -1,6 +1,6 @@
 """
-Orchestrates training runs that blend synthetic data with accumulated real
-samples drawn from the live dataset store.
+Orchestrates training runs using only accumulated real samples drawn from the
+live dataset store.
 
 The retrain is executed synchronously (for a manual /train call) or from the
 APScheduler background thread. It writes the updated model to MODEL_DIR and
@@ -16,54 +16,32 @@ import numpy as np
 
 from dataset import TrainingDataset
 from model import RandomForestRiskModel
-from synthetic_generator import generate
-
-
 def retrain(
     dataset: TrainingDataset,
     model_dir: str,
-    n_synthetic: int = 5000,
-    benign_fraction: float = 0.6,
     n_estimators: int = 200,
     max_depth: int = 12,
     seed: int = 42,
     reload_fn: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
-    """Retrain the RF with synthetic + live samples and save to model_dir.
+    """Retrain the RF with real observed samples and save to model_dir.
 
     Returns the metrics dict. Raises on failure — callers log the error.
     """
     X_real, y_real = dataset.fetch_all()
     run_id = dataset.record_retrain_start(
         n_real=int(X_real.shape[0]),
-        n_synthetic=int(n_synthetic),
+        n_synthetic=0,
     )
 
     try:
-        sources: List[str] = []
-        X_list: List[np.ndarray] = []
-        y_list: List[np.ndarray] = []
+        if X_real.shape[0] == 0:
+            raise RuntimeError("no training data: live dataset is empty")
 
-        if n_synthetic > 0:
-            Xs, ys = generate(n_synthetic, benign_fraction, seed)
-            X_list.append(Xs)
-            y_list.append(ys)
-            sources.append(f"synthetic:{n_synthetic}")
+        X = X_real
+        y = y_real
+        sources: List[str] = [f"live:{X_real.shape[0]}"]
 
-        if X_real.shape[0] > 0:
-            X_list.append(X_real)
-            y_list.append(y_real)
-            sources.append(f"live:{X_real.shape[0]}")
-
-        if not X_list:
-            raise RuntimeError("no training data: both synthetic and real stores empty")
-
-        X = np.concatenate(X_list, axis=0)
-        y = np.concatenate(y_list, axis=0)
-
-        # A healthy split requires both classes — if live is all-benign (common
-        # early in deployment) we're still fine because synthetic carries
-        # attacks. Guard the degenerate case anyway.
         if len(np.unique(y)) < 2:
             raise RuntimeError("training set has only one class; skipping retrain")
 
@@ -97,7 +75,7 @@ def retrain(
             "roc_auc": float(metrics["roc_auc"]),
             "n_samples": int(X.shape[0]),
             "n_real": int(X_real.shape[0]),
-            "n_synthetic": int(n_synthetic),
+            "n_synthetic": 0,
             "training_sources": sources,
             "top_features": model.top_features(8),
         }

@@ -11,6 +11,7 @@ require('dotenv').config();
  */
 
 const isProd = (process.env.NODE_ENV || 'development') === 'production';
+const mlEnabled = process.env.ML_SERVICE_ENABLED !== 'false';
 
 // Enforce required secrets in production
 function requireEnv(name) {
@@ -28,7 +29,8 @@ const config = {
   seedDemo: process.env.SEED_DEMO === 'true', // only seed demo data when explicitly requested
 
   // Database
-  dbPath: process.env.DB_PATH || undefined, // defaults to ./data/iam.db
+  dbPath: process.env.DB_PATH || undefined,
+  dbUrl: process.env.DATABASE_URL || '',
 
   // Bcrypt
   bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS || '12', 10),
@@ -45,6 +47,10 @@ const config = {
   // Anomaly detection
   anomalyWeight: parseFloat(process.env.ANOMALY_WEIGHT || '0.15'),
   anomalyThreshold: parseFloat(process.env.ANOMALY_THRESHOLD || '0.4'),
+  /** Require this many profile samples before using the normal anomaly threshold (cold-start hardening). */
+  anomalyColdStartMinSamples: parseInt(process.env.ANOMALY_COLDSTART_MIN_SAMPLES || '8', 10),
+  /** Extra margin added to the anomaly threshold while the profile is immature. */
+  anomalyColdStartEpsilon: parseFloat(process.env.ANOMALY_COLDSTART_EPSILON || '0.12'),
 
   // MFA
   mfaStepUpThreshold: parseFloat(process.env.MFA_STEP_UP_THRESHOLD || '0.3'),
@@ -83,6 +89,14 @@ const config = {
   fabricChaincodeName: process.env.FABRIC_CHAINCODE || 'iam-cc',
   fabricMspId: process.env.FABRIC_MSP_ID || 'Org1MSP',
   fabricPeerEndpoint: process.env.FABRIC_PEER_ENDPOINT || 'localhost:7051',
+  fabricPeerEndpointOrg2: process.env.FABRIC_PEER_ENDPOINT_ORG2 || 'localhost:9051',
+
+  // mTLS HTTPS (recommended in production: web-app → policy-engine uses a client certificate)
+  tlsEnabled: process.env.TLS_ENABLED === 'true',
+  tlsKeyPath: process.env.TLS_KEY_PATH || '',
+  tlsCertPath: process.env.TLS_CERT_PATH || '',
+  /** CA used to validate trusted service clients during the TLS handshake */
+  tlsClientCaPath: process.env.MTLS_CA_PATH || process.env.TLS_CLIENT_CA_PATH || '',
 
   // Cleanup job interval (ms)
   cleanupInterval: parseInt(process.env.CLEANUP_INTERVAL_MS || '300000', 10),
@@ -91,15 +105,31 @@ const config = {
   zkpEnabled: process.env.ZKP_ENABLED !== 'false',
   zkpExperimental: true,
 
+  // Encryption for at-rest local secrets
+  appEncryptionKey: isProd
+    ? requireEnv('APP_ENCRYPTION_KEY')
+    : (process.env.APP_ENCRYPTION_KEY || process.env.JWT_SECRET || 'local-dev-only-encryption-key'),
+
   // ML risk scoring sidecar (Python FastAPI)
-  mlServiceEnabled: process.env.ML_SERVICE_ENABLED !== 'false',
+  mlServiceEnabled: mlEnabled,
   mlServiceUrl: process.env.ML_SERVICE_URL || 'http://localhost:5000',
   mlServiceTimeoutMs: parseInt(process.env.ML_SERVICE_TIMEOUT_MS || '800', 10),
+  mlServiceToken: mlEnabled
+    ? (isProd ? requireEnv('ML_SERVICE_TOKEN') : (process.env.ML_SERVICE_TOKEN || 'dev-ml-service-token'))
+    : null,
 
   // Ensemble weights: AHP + ML + anomaly (must sum to 1)
   ensembleAhpWeight: parseFloat(process.env.ENSEMBLE_AHP_WEIGHT || '0.4'),
   ensembleMlWeight: parseFloat(process.env.ENSEMBLE_ML_WEIGHT || '0.4'),
   ensembleAnomalyWeight: parseFloat(process.env.ENSEMBLE_ANOMALY_WEIGHT || '0.2'),
 };
+
+if (isProd) {
+  requireEnv('DATABASE_URL');
+  if (!config.tlsEnabled) throw new Error('Production requires TLS_ENABLED=true for the policy-engine HTTP API');
+  requireEnv('TLS_KEY_PATH');
+  requireEnv('TLS_CERT_PATH');
+  requireEnv('MTLS_CA_PATH');
+}
 
 module.exports = config;

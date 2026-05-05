@@ -3,10 +3,11 @@
 const crypto = require('crypto');
 const config = require('./config');
 const db = require('./database');
+const blockchain = require('./fabricClient');
 
 /**
  * W3C DID Resolver for did:fabric:iam method — fully database-backed.
- * All DID documents and Verifiable Credentials persist in SQLite.
+ * All DID documents and Verifiable Credentials persist in PostgreSQL.
  */
 
 /**
@@ -26,7 +27,7 @@ function generateKeyPair() {
 /**
  * Create a DID document and persist it in the database.
  */
-function createDID(userId) {
+async function createDID(userId) {
   const did = `did:fabric:iam:${userId}`;
   const { publicKeyJwk, privateKey } = generateKeyPair();
   const timestamp = new Date().toISOString();
@@ -55,44 +56,65 @@ function createDID(userId) {
     updated: timestamp,
   };
 
-  db.storeDID(did, userId, didDocument, privateKey);
-  return { did, didDocument };
+  try {
+    const blockchainResult = await blockchain.createDID(userId, publicKeyJwk, 'JsonWebKey2020');
+    didDocument.txId = blockchainResult.txId;
+    await db.storeDID(did, userId, didDocument, privateKey);
+    return { did, didDocument, txId: blockchainResult.txId, status: blockchainResult.status };
+  } catch (err) {
+    if (!/already exists/i.test(err.message)) {
+      throw err;
+    }
+
+    const resolution = await blockchain.resolveDID(did);
+    await db.storeDID(did, userId, resolution.didDocument, null);
+    return {
+      did,
+      didDocument: resolution.didDocument,
+      txId: resolution.didDocument?.txId,
+      status: 'existing',
+    };
+  }
 }
 
 /**
  * Resolve a DID document from the database.
  */
-function resolveDID(did) {
-  const entry = db.getDID(did);
-  if (!entry) {
-    return {
-      '@context': 'https://w3id.org/did-resolution/v1',
-      didResolutionMetadata: { error: 'notFound' },
-      didDocument: null,
-      didDocumentMetadata: {},
-    };
+async function resolveDID(did) {
+  try {
+    const resolution = await blockchain.resolveDID(did);
+    const existing = await db.getDID(did);
+    await db.storeDID(did, existing?.userId || null, resolution.didDocument, existing?.privateKey || null);
+    if (resolution.didDocument?.deactivated) {
+      await db.deactivateDID(did);
+    }
+    return resolution;
+  } catch (err) {
+    if (/not found/i.test(err.message)) {
+      return {
+        '@context': 'https://w3id.org/did-resolution/v1',
+        didResolutionMetadata: { error: 'notFound' },
+        didDocument: null,
+        didDocumentMetadata: {},
+      };
+    }
+    throw err;
   }
-
-  return {
-    '@context': 'https://w3id.org/did-resolution/v1',
-    didResolutionMetadata: {
-      contentType: 'application/did+json',
-      retrieved: new Date().toISOString(),
-    },
-    didDocument: entry.document,
-    didDocumentMetadata: {
-      created: entry.document.created,
-      updated: entry.document.updated,
-      deactivated: entry.deactivated || false,
-    },
-  };
 }
 
 /**
  * Issue a Verifiable Credential and persist it in the database.
  */
-function issueCredential(issuerDid, subjectDid, types, claims) {
+async function issueCredential(issuerDid, subjectDid, types, claims) {
   const credentialId = `vc-${crypto.randomUUID().slice(0, 8)}`;
+  const blockchainResult = await blockchain.issueVerifiableCredential(
+    credentialId,
+    issuerDid,
+    subjectDid,
+    types,
+    claims
+  );
+
   const credential = {
     '@context': ['https://www.w3.org/2018/credentials/v1'],
     id: credentialId,
@@ -105,40 +127,37 @@ function issueCredential(issuerDid, subjectDid, types, claims) {
       created: new Date().toISOString(),
       proofPurpose: 'assertionMethod',
       verificationMethod: `${issuerDid}#key-1`,
-      blockchainTxId: `mock-${crypto.randomUUID().slice(0, 8)}`,
+      blockchainTxId: blockchainResult.txId,
+      channel: config.fabricChannelName,
     },
   };
 
-  db.storeVC(credentialId, issuerDid, subjectDid, credential);
+  await db.storeVC(credentialId, issuerDid, subjectDid, credential);
   return credential;
 }
 
 /**
  * Verify a Verifiable Credential from the database.
  */
-function verifyCredential(credentialId) {
-  const vcRow = db.getVC(credentialId);
-  if (!vcRow) {
-    return { verified: false, reason: 'Credential not found' };
+async function verifyCredential(credentialId) {
+  const result = await blockchain.verifyCredential(credentialId);
+  if (result.verified && result.credential) {
+    await db.storeVC(
+      credentialId,
+      result.credential.issuer,
+      result.credential.credentialSubject?.id,
+      result.credential
+    );
   }
-  const credential = vcRow.credential;
-
-  const issuerEntry = db.getDID(credential.issuer);
-  if (!issuerEntry) {
-    return { verified: false, reason: 'Issuer DID not found' };
-  }
-  if (issuerEntry.deactivated) {
-    return { verified: false, reason: 'Issuer DID deactivated' };
-  }
-
-  return { verified: true, credential };
+  return result;
 }
 
 /**
  * List all DIDs from the database.
  */
-function listDIDs() {
-  return db.getAllDIDs().map(row => ({
+async function listDIDs() {
+  const rows = await db.getAllDIDs();
+  return rows.map(row => ({
     did: row.did,
     userId: row.user_id,
     deactivated: !!row.deactivated,
@@ -149,24 +168,23 @@ function listDIDs() {
 /**
  * Seed DIDs for demo users into the database.
  */
-function seedDemoDIDs() {
-  // Only seed if not already present
-  if (db.getDID('did:fabric:iam:alice')) {
+async function seedDemoDIDs() {
+  if (await db.getDID('did:fabric:iam:alice')) {
     return {
       alice: 'did:fabric:iam:alice',
       bob: 'did:fabric:iam:bob',
     };
   }
 
-  const aliceDID = createDID('alice');
-  const bobDID = createDID('bob');
+  const aliceDID = await createDID('alice');
+  const bobDID = await createDID('bob');
 
-  issueCredential(
+  await issueCredential(
     aliceDID.did, aliceDID.did,
     ['RoleCredential'],
     { role: 'admin', grantedBy: 'system', grantedAt: new Date().toISOString() }
   );
-  issueCredential(
+  await issueCredential(
     aliceDID.did, bobDID.did,
     ['RoleCredential'],
     { role: 'viewer', grantedBy: 'alice', grantedAt: new Date().toISOString() }

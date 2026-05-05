@@ -16,7 +16,7 @@ const db = require('./database');
  */
 async function enrollMFA(userId) {
   const secret = otplib.generateSecret();
-  db.storeMFASecret(userId, secret);
+  await db.storeMFASecret(userId, secret);
 
   const otpauth = otplib.generateURI({
     issuer: config.mfaIssuer,
@@ -38,8 +38,8 @@ async function enrollMFA(userId) {
  * Verify a TOTP code for a user.
  * Reads the secret from the database.
  */
-function verifyTOTP(userId, token) {
-  const mfaData = db.getMFASecret(userId);
+async function verifyTOTP(userId, token) {
+  const mfaData = await db.getMFASecret(userId);
   if (!mfaData || !mfaData.enabled) {
     return { valid: false, reason: 'MFA not enrolled' };
   }
@@ -52,8 +52,8 @@ function verifyTOTP(userId, token) {
 /**
  * Check if a user has MFA enabled (from database).
  */
-function isMFAEnabled(userId) {
-  const mfaData = db.getMFASecret(userId);
+async function isMFAEnabled(userId) {
+  const mfaData = await db.getMFASecret(userId);
   return !!(mfaData && mfaData.enabled);
 }
 
@@ -70,11 +70,11 @@ function requiresStepUp(riskScore, requiredPermission) {
 /**
  * Seed MFA secrets for demo users into the database.
  */
-function seedDemoSecrets() {
+async function seedDemoSecrets() {
   const aliceSecret = otplib.generateSecret();
   const bobSecret = otplib.generateSecret();
-  db.storeMFASecret('alice', aliceSecret);
-  db.storeMFASecret('bob', bobSecret);
+  await db.storeMFASecret('alice', aliceSecret);
+  await db.storeMFASecret('bob', bobSecret);
   return { alice: aliceSecret, bob: bobSecret };
 }
 

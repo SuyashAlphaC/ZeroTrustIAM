@@ -8,7 +8,8 @@ RUN npm ci --omit=dev
 COPY . .
 
 ENV PORT=3000 \
-    POLICY_ENGINE_URL=http://policy-engine:4000
+    POLICY_ENGINE_URL=http://localhost:4000 \
+    POLICY_ENGINE_INTERNAL_URL=http://localhost:4000
 
 EXPOSE 3000
 

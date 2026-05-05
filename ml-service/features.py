@@ -11,6 +11,7 @@ share identical feature semantics.
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime
 from typing import List, Optional
 
@@ -37,6 +38,16 @@ FEATURE_NAMES: List[str] = [
     "profile_maturity_norm",
     "ip_is_private",
 ]
+
+
+FEATURE_VECTOR_VERSION = os.environ.get("ML_FEATURE_VECTOR_VERSION", "1")
+
+
+def clip_feature_vector(vec: np.ndarray) -> np.ndarray:
+    """Clamp pathological values from clients (adversarial robustness for inference)."""
+    v = np.asarray(vec, dtype=np.float32)
+    v = np.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(v, -10.0, 10.0)
 
 
 class LocationModel(BaseModel):
@@ -203,4 +214,4 @@ def extract_features(req: RiskRequest) -> np.ndarray:
         maturity_norm,
         ip_private,
     ]
-    return np.asarray(vec, dtype=np.float32)
+    return clip_feature_vector(np.asarray(vec, dtype=np.float32))

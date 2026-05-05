@@ -636,10 +636,10 @@ ZeroTrustIAM/
 │       │   ├── anomalyDetector.test.js   # Anomaly detection unit tests (DB-backed)
 │       │   ├── zkpVerifier.test.js       # ZKP proof generation/verification tests
 │       │   ├── database.test.js          # Database CRUD and constraint tests
-│       │   ├── mlRiskScorer.test.js      # ML sidecar HTTP client tests (fetch mocked)
+│       │   ├── mlRiskScorer.test.js      # ML sidecar HTTP client tests against a local HTTP test server
 │       │   └── riskScorerEnsemble.test.js # Ensemble blend + graceful fallback tests
 │       └── integration/
-│           └── api.test.js               # Full API integration tests (fabricClient mocked via jest.mock)
+│           └── api.test.js               # Full API integration tests against the real Fabric client path
 │
 ├── chaincode/                            # Hyperledger Fabric smart contract
 │   ├── Dockerfile                        # Node.js Alpine image for CCaaS
@@ -666,11 +666,10 @@ ZeroTrustIAM/
 │   ├── app.py                            # FastAPI: /health, /model/info, /predict, /model/reload
 │   ├── features.py                       # 17-feature Pydantic schema + extractor
 │   ├── model.py                          # RandomForestRiskModel (train/predict/explain/save/load)
-│   ├── synthetic_generator.py            # 5 attack profiles + benign training data
 │   ├── public_loader.py                  # Optional RBA dataset loader
-│   ├── train.py                          # CLI trainer
+│   ├── train.py                          # CLI trainer for live/public datasets
 │   ├── requirements.txt                  # FastAPI, scikit-learn, pandas, joblib
-│   └── Dockerfile                        # Container image w/ pre-trained model
+│   └── Dockerfile                        # Container image for live-data scoring service
 │
 └── test/
     ├── test-phase1.sh                    # cURL-based smoke tests against live Fabric
@@ -736,7 +735,8 @@ the services:
 cd ml-service
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python train.py --n-synthetic 10000 --model-dir ./models
+# Optional: train immediately if you already have real samples or a public RBA CSV
+python train.py --dataset ./models/training_samples.db --public /path/to/rba-dataset.csv --model-dir ./models
 MODEL_DIR=./models uvicorn app:app --host 0.0.0.0 --port 5000
 
 # Terminal 2: Policy Engine (connects to live Fabric + ML sidecar)
@@ -835,13 +835,13 @@ SEED_DEMO=true npm run test:unit
 SEED_DEMO=true npm run test:integration
 ```
 
-The Jest test suite mocks `fabricClient` via `jest.mock()` so unit and
-integration tests do not require a live Fabric peer — the live-chain path
-is exercised separately by `test/attack-scenarios.js` and `test/test-phase1.sh`.
+The Jest suite exercises the real `fabricClient` path. The Node-only ML client
+tests use a local ephemeral HTTP server, and the live-chain path is also
+covered by `test/attack-scenarios.js` and `test/test-phase1.sh`.
 
 The test suite includes:
 - **Unit tests**: AHP risk scoring, RF ensemble blend, ML HTTP client, anomaly detection, ZKP proofs, database CRUD
-- **Integration tests**: full API endpoint testing with supertest (auth flows, token management, MFA, OAuth, DIDs) — `fabricClient` mocked
+- **Integration tests**: full API endpoint testing with supertest (auth flows, token management, MFA, OAuth, DIDs) against the real Fabric client path
 
 #### Run E2E Attack Simulations
 

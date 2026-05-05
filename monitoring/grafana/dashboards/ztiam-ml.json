@@ -1,0 +1,93 @@
+{
+  "title": "ZeroTrustIAM — ML Service",
+  "uid": "ztiam-ml",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "tags": ["ztiam", "ml"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Model Loaded",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": { "0": { "text": "DEGRADED", "color": "red" }, "1": { "text": "OK", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "targets": [{ "expr": "ml_model_loaded", "legendFormat": "model" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Training Samples (total)",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [{ "expr": "ml_training_samples_total", "legendFormat": "total" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Benign Samples",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "targets": [{ "expr": "ml_training_samples_total{label=\"benign\"}", "legendFormat": "benign" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Attack Samples",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 100 }] } } },
+      "targets": [{ "expr": "ml_training_samples_total{label=\"attack\"}", "legendFormat": "attack" }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Retrain Successes",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "targets": [{ "expr": "ml_retrain_success_total", "legendFormat": "successes" }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Retrain Errors",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } },
+      "targets": [{ "expr": "ml_retrain_error_total", "legendFormat": "errors" }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Prediction Rate (req/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "rate(ml_predict_total[5m])", "legendFormat": "predictions/s" },
+        { "expr": "rate(ml_predict_error_total[5m])", "legendFormat": "errors/s" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Ingest Rate (samples/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "rate(ml_ingest_total[5m])", "legendFormat": "ingested/s" },
+        { "expr": "rate(ml_ingest_error_total[5m])", "legendFormat": "ingest errors/s" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Training Sample Growth",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "ml_training_samples_total", "legendFormat": "total" },
+        { "expr": "ml_training_samples_total{label=\"benign\"}", "legendFormat": "benign" },
+        { "expr": "ml_training_samples_total{label=\"attack\"}", "legendFormat": "attack" }
+      ]
+    }
+  ]
+}

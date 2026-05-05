@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: policy-engine
+  namespace: ztiam
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: policy-engine
+  template:
+    metadata:
+      labels:
+        app: policy-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: policy-engine
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: policy-engine
+          image: ztiam/policy-engine:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4000
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+              scheme: HTTPS
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          envFrom:
+            - configMapRef:
+                name: ztiam-policy-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: JWT_SECRET
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: JWT_REFRESH_SECRET
+            - name: OAUTH_DEFAULT_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: OAUTH_DEFAULT_CLIENT_SECRET
+            - name: APP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: APP_ENCRYPTION_KEY
+            - name: ML_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ztiam-secrets
+                  key: ML_SERVICE_TOKEN
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: policy-engine
+  namespace: ztiam
+spec:
+  ports:
+    - port: 4000
+      targetPort: 4000
+  selector:
+    app: policy-engine

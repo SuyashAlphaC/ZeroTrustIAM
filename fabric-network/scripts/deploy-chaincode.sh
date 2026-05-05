@@ -11,8 +11,14 @@ CC_NAME="iam-cc"
 CC_VERSION="1.0"
 CC_SEQUENCE=1
 
-PEER_TLS_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt"
+PEER1_TLS_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt"
+PEER2_TLS_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt"
 ORDERER_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem"
+
+ORG2_PEER_BASE="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls"
+ORG2_ADMIN_MSP="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org2.example.com/users/Admin@org2.example.com/msp"
+
+SIGNATURE_POLICY="AND('Org1MSP.peer','Org2MSP.peer')"
 
 echo "============================================"
 echo "  Deploying IAM Chaincode (CCaaS)"
@@ -20,7 +26,7 @@ echo "============================================"
 echo ""
 
 # Step 1: Create the CCaaS chaincode package
-echo "[1/7] Creating CCaaS chaincode package..."
+echo "[1/9] Creating CCaaS chaincode package..."
 
 CCAAS_PKG_DIR=$(mktemp -d)
 
@@ -51,19 +57,31 @@ rm -rf "${CCAAS_PKG_DIR}"
 echo "  CCaaS package created."
 
 # Step 2: Copy package to CLI container
-echo "[2/7] Copying package to CLI container..."
+echo "[2/9] Copying package to CLI container..."
 docker cp "${NETWORK_DIR}/${CC_NAME}.tar.gz" cli:/opt/gopath/src/github.com/hyperledger/fabric/peer/${CC_NAME}.tar.gz
 echo "  Package copied."
 
-# Step 3: Install chaincode on peer
-echo "[3/7] Installing chaincode on peer..."
+# Step 3: Install chaincode on Org1 peer
+echo "[3/9] Installing chaincode on peer0.org1..."
 docker exec cli peer lifecycle chaincode install ${CC_NAME}.tar.gz
-echo "  Chaincode installed."
+echo "  Installed on Org1 peer."
 
-# Step 4: Get package ID
-echo "[4/7] Querying installed chaincode..."
+# Step 4: Install chaincode on Org2 peer
+echo "[4/9] Installing chaincode on peer0.org2..."
+docker exec \
+  -e CORE_PEER_LOCALMSPID=Org2MSP \
+  -e CORE_PEER_ADDRESS=peer0.org2.example.com:7051 \
+  -e CORE_PEER_TLS_CERT_FILE="${ORG2_PEER_BASE}/server.crt" \
+  -e CORE_PEER_TLS_KEY_FILE="${ORG2_PEER_BASE}/server.key" \
+  -e CORE_PEER_TLS_ROOTCERT_FILE="${ORG2_PEER_BASE}/ca.crt" \
+  -e CORE_PEER_MSPCONFIGPATH="${ORG2_ADMIN_MSP}" \
+  cli peer lifecycle chaincode install ${CC_NAME}.tar.gz
+echo "  Installed on Org2 peer."
+
+# Step 5: Get package ID
+echo "[5/9] Querying installed chaincode..."
 PACKAGE_ID=$(docker exec cli peer lifecycle chaincode queryinstalled --output json | \
-  python3 -c "import sys,json; refs=json.load(sys.stdin).get('installed_chaincodes',[]); print(refs[0]['package_id'] if refs else '')")
+  python3 -c "import sys,json; refs=json.load(sys.stdin).get('installed_chaincodes',[]); matching=[x for x in refs if '${CC_NAME}_${CC_VERSION}' in x.get('label','')]; print(matching[0]['package_id'] if matching else (refs[0]['package_id'] if refs else ''))")
 
 if [ -z "$PACKAGE_ID" ]; then
   echo "  ERROR: Could not find installed chaincode package ID"
@@ -71,8 +89,8 @@ if [ -z "$PACKAGE_ID" ]; then
 fi
 echo "  Package ID: ${PACKAGE_ID}"
 
-# Step 5: Restart chaincode container with the correct CHAINCODE_ID
-echo "[5/7] Starting chaincode container with correct ID..."
+# Step 6: Restart chaincode container with the correct CHAINCODE_ID
+echo "[6/9] Starting chaincode container with correct ID..."
 cd "${NETWORK_DIR}"
 docker compose stop iam-chaincode 2>/dev/null || true
 docker compose rm -f iam-chaincode 2>/dev/null || true
@@ -83,35 +101,59 @@ docker compose up -d iam-chaincode
 echo "  Waiting for chaincode container to start..."
 sleep 5
 
-# Verify chaincode container is running
 echo "  Chaincode container logs:"
 docker logs iam-chaincode 2>&1 | tail -5
 
-# Step 6: Approve chaincode for Org1
-echo "[6/7] Approving chaincode for Org1..."
+# Step 7: Approve chaincode for Org1
+echo "[7/9] Approving chaincode for Org1..."
 docker exec cli peer lifecycle chaincode approveformyorg \
   --channelID "${CHANNEL_NAME}" \
   --name "${CC_NAME}" \
   --version "${CC_VERSION}" \
   --package-id "${PACKAGE_ID}" \
   --sequence ${CC_SEQUENCE} \
+  --signature-policy "${SIGNATURE_POLICY}" \
   --tls \
   --cafile "${ORDERER_CA}" \
   -o orderer.example.com:7050
-echo "  Chaincode approved."
+echo "  Org1 approved."
 
-# Step 7: Commit chaincode
-echo "[7/7] Committing chaincode..."
+# Step 8: Approve chaincode for Org2
+echo "[8/9] Approving chaincode for Org2..."
+docker exec \
+  -e CORE_PEER_LOCALMSPID=Org2MSP \
+  -e CORE_PEER_ADDRESS=peer0.org2.example.com:7051 \
+  -e CORE_PEER_TLS_CERT_FILE="${ORG2_PEER_BASE}/server.crt" \
+  -e CORE_PEER_TLS_KEY_FILE="${ORG2_PEER_BASE}/server.key" \
+  -e CORE_PEER_TLS_ROOTCERT_FILE="${ORG2_PEER_BASE}/ca.crt" \
+  -e CORE_PEER_MSPCONFIGPATH="${ORG2_ADMIN_MSP}" \
+  cli peer lifecycle chaincode approveformyorg \
+  --channelID "${CHANNEL_NAME}" \
+  --name "${CC_NAME}" \
+  --version "${CC_VERSION}" \
+  --package-id "${PACKAGE_ID}" \
+  --sequence ${CC_SEQUENCE} \
+  --signature-policy "${SIGNATURE_POLICY}" \
+  --tls \
+  --cafile "${ORDERER_CA}" \
+  -o orderer.example.com:7050
+echo "  Org2 approved."
+
+# Step 9: Commit chaincode
+echo "[9/9] Committing chaincode..."
 docker exec cli peer lifecycle chaincode commit \
   --channelID "${CHANNEL_NAME}" \
   --name "${CC_NAME}" \
   --version "${CC_VERSION}" \
   --sequence ${CC_SEQUENCE} \
+  --signature-policy "${SIGNATURE_POLICY}" \
   --tls \
   --cafile "${ORDERER_CA}" \
   -o orderer.example.com:7050 \
   --peerAddresses peer0.org1.example.com:7051 \
-  --tlsRootCertFiles "${PEER_TLS_CA}"
+  --peerAddresses peer0.org2.example.com:7051 \
+  --tlsRootCertFiles "${PEER1_TLS_CA}" \
+  --tlsRootCertFiles "${PEER2_TLS_CA}"
 echo "  Chaincode committed."
 
 # Verify deployment
@@ -134,7 +176,9 @@ docker exec cli peer chaincode invoke \
   -C "${CHANNEL_NAME}" \
   -n "${CC_NAME}" \
   --peerAddresses peer0.org1.example.com:7051 \
-  --tlsRootCertFiles "${PEER_TLS_CA}" \
+  --peerAddresses peer0.org2.example.com:7051 \
+  --tlsRootCertFiles "${PEER1_TLS_CA}" \
+  --tlsRootCertFiles "${PEER2_TLS_CA}" \
   -c '{"function":"InitLedger","Args":[]}'
 
 sleep 2

@@ -4,10 +4,10 @@ Optional loader for the Risk-Based Authentication (RBA) public dataset.
 The dataset (IEEE DataPort, Wiefling et al.) ships as a single CSV where each
 row is an authentication attempt with device/location/time fields and an
 is_attack_ip label. We project each row into the same 17-feature vector used
-by the synthetic generator so the two sources can be concatenated directly.
+by the live training pipeline.
 
-If the CSV is absent we return an empty array rather than failing — training
-must remain possible with synthetic data alone.
+If the CSV is absent we return an empty array rather than failing so callers
+can decide whether to proceed with the locally observed dataset only.
 """
 
 from __future__ import annotations

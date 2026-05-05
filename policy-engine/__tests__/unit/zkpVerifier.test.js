@@ -8,7 +8,6 @@ describe('zkpVerifier', () => {
       const r = randomBlindingFactor();
       expect(typeof r).toBe('bigint');
       expect(r).toBeGreaterThan(BigInt(0));
-      expect(r).toBeLessThan(PARAMS.p);
     });
 
     it('generates unique values', () => {
@@ -22,8 +21,8 @@ describe('zkpVerifier', () => {
     it('creates a Pedersen commitment', () => {
       const r = randomBlindingFactor();
       const c = commit(0.5, r);
-      expect(typeof c).toBe('bigint');
-      expect(c).toBeGreaterThan(BigInt(0));
+      expect(typeof c).toBe('string');
+      expect(c).toMatch(/^(02|03)[0-9a-f]{64}$/);
     });
 
     it('produces different commitments for different values', () => {
@@ -47,9 +46,11 @@ describe('zkpVerifier', () => {
       const r = randomBlindingFactor();
       const proof = createRangeProof(0.3, 0.6, r);
       expect(proof).not.toBeNull();
-      expect(proof.proofType).toBe('PedersenRangeProof');
+      expect(proof.proofType).toBe('PedersenBitRangeProof');
       expect(proof.threshold).toBe(600);
       expect(proof.proofId).toBeDefined();
+      expect(proof.valueBits).toHaveLength(10);
+      expect(proof.diffBits).toHaveLength(10);
     });
 
     it('returns null when value >= threshold', () => {
@@ -86,13 +87,13 @@ describe('zkpVerifier', () => {
       expect(result.reason).toContain('Invalid proof type');
     });
 
-    it('rejects tampered proof (modified challenge)', () => {
+    it('rejects tampered proof (modified bit challenge)', () => {
       const r = randomBlindingFactor();
       const proof = createRangeProof(0.3, 0.6, r);
-      proof.challenge = '12345';
+      proof.valueBits[0].proof.e0 = '12345';
       const result = verifyRangeProof(proof);
       expect(result.valid).toBe(false);
-      expect(result.reason).toContain('Challenge verification failed');
+      expect(result.reason).toContain('Invalid value bit proof');
     });
   });
 
@@ -103,13 +104,14 @@ describe('zkpVerifier', () => {
       expect(pkg.commitment).toBeDefined();
       expect(pkg.rangeProof).toBeDefined();
       expect(pkg.metadata.scheme).toContain('Pedersen');
-      expect(pkg.metadata.property).toBe('risk_score < 0.6');
+      expect(pkg.metadata.property).toBe('0 <= risk_score < 0.6');
+      expect(pkg.metadata.rawRiskDisclosedToVerifier).toBe(false);
     });
 
     it('fails for risk score above threshold', () => {
       const pkg = createZKPPackage(0.8, 0.6);
       expect(pkg.success).toBe(false);
-      expect(pkg.reason).toContain('not below threshold');
+      expect(pkg.reason).toContain('required range');
     });
 
     it('creates verifiable end-to-end proof', () => {

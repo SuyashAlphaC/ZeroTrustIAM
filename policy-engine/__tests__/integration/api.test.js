@@ -1,51 +1,17 @@
 'use strict';
 
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-
-// Setup test database before requiring any app modules
-const TEST_DB_DIR = path.join(os.tmpdir(), `zt-iam-api-test-${Date.now()}`);
-process.env.DB_PATH = path.join(TEST_DB_DIR, 'test.db');
+process.env.TEST_DATABASE_URL = process.env.TEST_DATABASE_URL
+  || 'postgresql://ztiam:testpassword@127.0.0.1:5432/ztiam_test';
 process.env.SEED_DEMO = 'true';
-process.env.PORT = '0'; // random available port
+process.env.PORT = '0';
+process.env.NODE_ENV = 'test';
 process.env.RATE_LIMIT_MAX = '200';
 process.env.RATE_LIMIT_AUTH_MAX = '200';
 process.env.LOG_LEVEL = 'silent';
 process.env.ML_SERVICE_ENABLED = 'false';
-
-// Mock the Fabric client so unit/integration tests don't require a live peer.
-// The live-chain path is validated separately by the end-to-end smoke test.
-jest.mock('../../fabricClient', () => {
-  const crypto = require('crypto');
-  const users = {
-    alice: { userId: 'alice', role: 'admin', registeredDevices: ['dev-001'], status: 'ACTIVE' },
-    bob: { userId: 'bob', role: 'viewer', registeredDevices: ['dev-002'], status: 'ACTIVE' },
-  };
-  const rolePerms = { admin: ['read', 'write', 'delete', 'manage'], viewer: ['read'] };
-  const auditLog = [];
-
-  return {
-    evaluateAccess: jest.fn(async (userId, deviceId, riskScore, requiredPermission) => {
-      const txId = crypto.randomBytes(16).toString('hex');
-      const user = users[userId];
-      const decide = (decision, reason) => {
-        auditLog.push({ txId, userId, deviceId, riskScore, decision, reason, timestamp: new Date().toISOString() });
-        return { decision, reason, txId, layer: 'Smart Contract (Hyperledger Fabric)' };
-      };
-      if (!user) return decide('DENY', 'User not found');
-      if (user.status !== 'ACTIVE') return decide('DENY', 'Account suspended');
-      if (!user.registeredDevices.includes(deviceId)) return decide('DENY', 'Unregistered device');
-      const score = parseFloat(riskScore);
-      if (score >= 0.6) return decide('DENY', `Risk score ${score} exceeds threshold`);
-      if (!rolePerms[user.role].includes(requiredPermission)) {
-        return decide('DENY', `Role ${user.role} lacks permission ${requiredPermission}`);
-      }
-      return decide('ALLOW', 'All policy checks passed');
-    }),
-    getAuditLog: jest.fn(async () => auditLog.slice()),
-  };
-});
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-integration';
+process.env.JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'test-refresh-integration';
+process.env.OAUTH_DEFAULT_CLIENT_SECRET = process.env.OAUTH_DEFAULT_CLIENT_SECRET || 'test-oauth-client';
 
 const request = require('supertest');
 const { app, start } = require('../../server');
@@ -54,9 +20,11 @@ const db = require('../../database');
 let server;
 
 beforeAll(async () => {
-  server = start();
-  // Wait for server to be ready
-  await new Promise(resolve => {
+  await db.init();
+  await db.truncateTestData();
+  await db._prepareStatements();
+  server = await start();
+  await new Promise((resolve) => {
     if (server.listening) return resolve();
     server.on('listening', resolve);
   });
@@ -64,12 +32,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (server) {
-    await new Promise(resolve => server.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
   }
-  db.close();
-  try {
-    fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
-  } catch { /* ignore */ }
+  await db.close();
 });
 
 describe('API Integration Tests', () => {
@@ -80,6 +45,18 @@ describe('API Integration Tests', () => {
       expect(res.body.status).toBe('healthy');
       expect(res.body.blockchain).toBe('fabric');
       expect(res.body.database).toBe('connected');
+    });
+  });
+
+  describe('GET /v1/health', () => {
+    it('matches unversioned /health core fields', async () => {
+      const root = await request(app).get('/health');
+      const v1 = await request(app).get('/v1/health');
+      expect(v1.status).toBe(root.status);
+      expect(v1.body.status).toBe(root.body.status);
+      expect(v1.body.database).toBe(root.body.database);
+      expect(v1.body.blockchain).toBe(root.body.blockchain);
+      expect(v1.body.version).toBe(root.body.version);
     });
   });
 
@@ -291,7 +268,7 @@ describe('API Integration Tests', () => {
       expect(res.body.accessToken).toBeDefined();
       expect(res.body.refreshToken).toBeDefined();
       // Old token should be revoked
-      expect(db.isRefreshTokenValid(refreshToken)).toBe(false);
+      expect(await db.isRefreshTokenValid(refreshToken)).toBe(false);
     });
 
     it('rejects revoked refresh token', async () => {

@@ -3,7 +3,7 @@
 Responsibilities:
   * /predict                 -- score a login attempt
   * /ingest                  -- accept a labeled feature vector for future retrain
-  * /train                   -- synchronously retrain on synthetic + live store
+  * /train                   -- synchronously retrain on the live sample store
   * /model/reload            -- hot-swap the in-memory model from disk
   * /model/info, /dataset/stats, /health, /metrics -- observability
 
@@ -23,12 +23,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, conint
 
 from dataset import TrainingDataset
-from features import FEATURE_NAMES, RiskRequest, extract_features
+from features import FEATURE_NAMES, FEATURE_VECTOR_VERSION, RiskRequest, extract_features
 from model import RandomForestRiskModel
 from retrainer import retrain
 
@@ -41,9 +41,9 @@ DATASET_PATH = os.environ.get(
 RETRAIN_INTERVAL_MINUTES = int(os.environ.get("ML_RETRAIN_INTERVAL_MINUTES", "30"))
 RETRAIN_MIN_NEW_SAMPLES = int(os.environ.get("ML_RETRAIN_MIN_NEW_SAMPLES", "50"))
 RETRAIN_ON_STARTUP_IF_MISSING = (
-    os.environ.get("ML_RETRAIN_ON_STARTUP_IF_MISSING", "true").lower() == "true"
+    os.environ.get("ML_RETRAIN_ON_STARTUP_IF_MISSING", "false").lower() == "true"
 )
-RETRAIN_SYNTHETIC_SAMPLES = int(os.environ.get("ML_RETRAIN_SYNTHETIC_SAMPLES", "5000"))
+SERVICE_TOKEN = os.environ.get("ML_SERVICE_TOKEN", "")
 
 
 logger = logging.getLogger("ml-service")
@@ -71,11 +71,29 @@ _metrics: Dict[str, int] = {
 _last_retrain_sample_count: int = 0
 
 
+def _require_service_token(x_ml_service_token: Optional[str]) -> None:
+    """Require the shared service token for mutating or scoring POST endpoints."""
+    if not SERVICE_TOKEN:
+        return
+    if x_ml_service_token != SERVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
 def _load_model() -> None:
     global _model, _load_error
     with _model_lock:
         try:
-            _model = RandomForestRiskModel.load(MODEL_DIR)
+            model = RandomForestRiskModel.load(MODEL_DIR)
+            invalid_sources = [
+                source for source in (model.meta.training_sources or [])
+                if str(source).startswith("synthetic")
+            ]
+            if invalid_sources:
+                raise ValueError(
+                    "model was trained with non-live sources and is no longer accepted: "
+                    + ", ".join(invalid_sources)
+                )
+            _model = model
             _load_error = None
             logger.info(
                 "model loaded: n_samples=%s trained_at=%s",
@@ -109,7 +127,6 @@ def _scheduled_retrain() -> None:
         metrics = retrain(
             dataset=_dataset,
             model_dir=MODEL_DIR,
-            n_synthetic=RETRAIN_SYNTHETIC_SAMPLES,
             reload_fn=_load_model,
         )
         _last_retrain_sample_count = total
@@ -134,20 +151,17 @@ def _startup() -> None:
     _load_model()
     _last_retrain_sample_count = _dataset.count()
 
-    # Cold-start: if no model is present on disk, bootstrap one from synthetic
-    # data so /predict is immediately available. This matches how the thesis
-    # describes the sidecar being "online from the first request".
+    # Cold-start: only build a model when enough real samples already exist.
     if _model is None and RETRAIN_ON_STARTUP_IF_MISSING:
         try:
-            logger.info("no model found on disk; bootstrapping from synthetic data")
+            logger.info("no model found on disk; attempting live-data startup retrain")
             retrain(
                 dataset=_dataset,
                 model_dir=MODEL_DIR,
-                n_synthetic=RETRAIN_SYNTHETIC_SAMPLES,
                 reload_fn=_load_model,
             )
         except Exception as exc:
-            logger.error("bootstrap retrain failed: %s", exc)
+            logger.info("startup retrain skipped: %s", exc)
 
     if RETRAIN_INTERVAL_MINUTES > 0:
         _scheduler.add_job(
@@ -169,7 +183,7 @@ def _startup() -> None:
 @app.on_event("shutdown")
 def _shutdown() -> None:
     if _scheduler.running:
-        _scheduler.shutdown(wait=False)
+        _scheduler.shutdown(wait=True)
 
 
 @app.get("/health")
@@ -195,13 +209,18 @@ def model_info() -> Dict[str, Any]:
 
 
 @app.post("/model/reload")
-def model_reload() -> Dict[str, Any]:
+def model_reload(x_ml_service_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _require_service_token(x_ml_service_token)
     _load_model()
     return {"reloaded": _model is not None, "error": _load_error}
 
 
 @app.post("/predict")
-def predict(req: RiskRequest) -> JSONResponse:
+def predict(
+    req: RiskRequest,
+    x_ml_service_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _require_service_token(x_ml_service_token)
     if _model is None:
         _metrics["predict_error_total"] += 1
         raise HTTPException(status_code=503, detail=f"Model not loaded: {_load_error}")
@@ -214,6 +233,8 @@ def predict(req: RiskRequest) -> JSONResponse:
             {
                 "risk_score": round(proba, 4),
                 "model_version": _model.meta.model_version,
+                "feature_vector_version": FEATURE_VECTOR_VERSION,
+                "n_features": len(FEATURE_NAMES),
                 "features": dict(zip(FEATURE_NAMES, [float(v) for v in x.tolist()])),
                 "explanation": explanation,
             }
@@ -241,7 +262,11 @@ class IngestRequest(BaseModel):
 
 
 @app.post("/ingest")
-def ingest(req: IngestRequest) -> Dict[str, Any]:
+def ingest(
+    req: IngestRequest,
+    x_ml_service_token: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_service_token(x_ml_service_token)
     try:
         if req.features is not None:
             feats = list(req.features)
@@ -270,22 +295,22 @@ def ingest(req: IngestRequest) -> Dict[str, Any]:
 
 
 class TrainRequest(BaseModel):
-    n_synthetic: int = RETRAIN_SYNTHETIC_SAMPLES
-    benign_fraction: float = 0.6
     n_estimators: int = 200
     max_depth: int = 12
 
 
 @app.post("/train")
-def train(req: TrainRequest) -> Dict[str, Any]:
+def train(
+    req: TrainRequest,
+    x_ml_service_token: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_service_token(x_ml_service_token)
     global _last_retrain_sample_count
     try:
         t0 = time.time()
         result = retrain(
             dataset=_dataset,
             model_dir=MODEL_DIR,
-            n_synthetic=req.n_synthetic,
-            benign_fraction=req.benign_fraction,
             n_estimators=req.n_estimators,
             max_depth=req.max_depth,
             reload_fn=_load_model,

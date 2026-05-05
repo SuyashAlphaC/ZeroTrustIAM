@@ -20,11 +20,8 @@ cd ml-service
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Train on synthetic data only (fastest path — no external downloads)
-python train.py --n-synthetic 10000 --model-dir ./models
-
-# Or include the RBA public dataset if you have it
-python train.py --n-synthetic 10000 --public /path/to/rba-dataset.csv --model-dir ./models
+# Train from the live SQLite sample store and optionally merge a public RBA CSV
+python train.py --dataset ./models/training_samples.db --public /path/to/rba-dataset.csv --model-dir ./models
 
 # Serve
 MODEL_DIR=./models uvicorn app:app --host 0.0.0.0 --port 5000
@@ -45,16 +42,13 @@ from the existing user profile + request context.
 
 ## Training strategies
 
-1. **Synthetic** — `synthetic_generator.py` samples a configurable mix of
-   benign plus five attack profiles (stolen_credentials, impossible_travel,
-   credential_stuffing, off_hours_privilege, insider_threat). Always available,
-   no external data.
+1. **Live** — `dataset.py` stores observed labeled samples ingested from the
+   policy engine after real authorization decisions.
 2. **Public** — `public_loader.py` reads the IEEE DataPort RBA dataset CSV and
-   projects each row into the same 17-feature vector. Silently returns empty
-   if the path does not exist, so the synthetic path still works.
+   projects each row into the same 17-feature vector used by the live model.
 
-Both sources are concatenated before training — the model sees one uniform
-dataset.
+Training can use the live dataset alone or combine it with the public RBA
+dataset when you want additional real-world coverage.
 
 ## Integration contract
 

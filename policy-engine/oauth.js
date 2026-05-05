@@ -5,29 +5,20 @@ const crypto = require('crypto');
 const config = require('./config');
 const db = require('./database');
 
-/**
- * OAuth 2.0 / OIDC module — fully database-backed.
- * RSA keys persisted in signing_keys table.
- * Auth codes and clients stored in database, not in-memory Maps.
- */
+let rsaPrivateKey;
+let rsaPublicKey;
+let rsaJwk;
 
-let rsaPrivateKey, rsaPublicKey, rsaJwk;
-
-/**
- * Initialize or restore RSA key pair from database.
- * On first run, generates a new pair and persists it.
- * On subsequent runs, loads the existing key from the database.
- */
-function initKeys() {
-  let oauthKey = db.getActiveSigningKey('oauth_rsa');
+async function initKeys() {
+  let oauthKey = await db.getActiveSigningKey('oauth_rsa');
   if (!oauthKey) {
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 2048,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
       privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
     });
-    db.storeSigningKey('oauth-rsa-' + Date.now(), 'oauth_rsa', privateKey, publicKey, 'RS256');
-    oauthKey = db.getActiveSigningKey('oauth_rsa');
+    await db.storeSigningKey(`oauth-rsa-${Date.now()}`, 'oauth_rsa', privateKey, publicKey, 'RS256');
+    oauthKey = await db.getActiveSigningKey('oauth_rsa');
   }
   rsaPrivateKey = oauthKey.private_key;
   rsaPublicKey = oauthKey.public_key;
@@ -37,27 +28,20 @@ function initKeys() {
   rsaJwk = { ...jwkExport, kid: oauthKey.key_id, use: 'sig', alg: 'RS256' };
 }
 
-/**
- * Generate an authorization code and store it in the database.
- */
-function createAuthorizationCode(userId, clientId, redirectUri, scope, nonce) {
+async function createAuthorizationCode(userId, clientId, redirectUri, scope, nonce) {
   const code = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + config.oauthCodeExpiry * 1000).toISOString();
-  db.storeOAuthCode(code, userId, clientId, redirectUri, scope || 'openid', nonce, expiresAt);
+  await db.storeOAuthCode(code, userId, clientId, redirectUri, scope || 'openid', nonce, expiresAt);
   return code;
 }
 
-/**
- * Exchange an authorization code for tokens.
- * Reads the code and client from the database.
- */
-function exchangeCode(code, clientId, clientSecret, redirectUri) {
-  const codeData = db.consumeOAuthCode(code);
+async function exchangeCode(code, clientId, clientSecret, redirectUri) {
+  const codeData = await db.consumeOAuthCode(code);
   if (!codeData) {
     return { error: 'invalid_grant', error_description: 'Authorization code not found or expired' };
   }
 
-  const client = db.getOAuthClient(clientId);
+  const client = await db.getOAuthClient(clientId);
   if (!client || client.clientSecret !== clientSecret) {
     return { error: 'invalid_client', error_description: 'Invalid client credentials' };
   }
@@ -103,9 +87,6 @@ function exchangeCode(code, clientId, clientSecret, redirectUri) {
   return response;
 }
 
-/**
- * Verify an OAuth access token.
- */
 function verifyAccessToken(token) {
   try {
     const decoded = jwt.verify(token, rsaPublicKey, {
@@ -119,9 +100,6 @@ function verifyAccessToken(token) {
   }
 }
 
-/**
- * OIDC discovery document.
- */
 function getDiscoveryDocument() {
   const issuer = config.oauthIssuer;
   return {

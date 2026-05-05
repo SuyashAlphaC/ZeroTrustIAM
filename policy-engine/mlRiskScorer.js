@@ -65,13 +65,19 @@ async function scoreWithML(userProfile, requestContext, opts = {}) {
   if (!config.mlServiceEnabled) {
     return { available: false, error: 'disabled' };
   }
+  const { getRequestId } = require('./requestContext');
+  const rid = getRequestId();
   const body = toRiskRequest(userProfile, requestContext, opts);
   try {
     const res = await fetchWithTimeout(
       `${config.mlServiceUrl}/predict`,
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-ml-service-token': config.mlServiceToken,
+          ...(rid ? { 'x-request-id': rid } : {}),
+        },
         body: JSON.stringify(body),
       },
       config.mlServiceTimeoutMs
@@ -103,9 +109,9 @@ async function scoreWithML(userProfile, requestContext, opts = {}) {
  *          Suspended, RBAC lack, wrong password) -> attack (1)
  *  - MFA_REQUIRED + verified downstream          -> benign (0)
  *
- * The soft "benign" signal from successful logins isn't perfect but gives the
- * model a growing baseline of real legitimate traffic; paired with synthetic
- * attack coverage the RF stays well-calibrated.
+ * The soft "benign" signal from successful logins isn't perfect but it gives
+ * the model a growing baseline of real legitimate traffic for subsequent
+ * retraining.
  */
 function deriveLabel(decision, reason) {
   if (decision === 'ALLOW' || decision === 'MFA_REQUIRED') return 0;
@@ -132,13 +138,19 @@ function ingestSample(userProfile, requestContext, opts = {}) {
     reason: opts.reason,
   };
 
+  const { getRequestId } = require('./requestContext');
+  const rid = getRequestId();
+
   // Fire-and-forget — use a generous timeout but never await from the handler.
   fetchWithTimeout(
     `${config.mlServiceUrl}/ingest`,
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: {
+        'content-type': 'application/json',
+        'x-ml-service-token': config.mlServiceToken,
+        ...(rid ? { 'x-request-id': rid } : {}),
+      },
     },
     config.mlServiceTimeoutMs * 2
   ).then(async (res) => {
