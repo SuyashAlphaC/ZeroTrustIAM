@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>My Data · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireAuth, getSession } from '/js/auth.js';
+  import { renderShell, pageHead, toast, confirm, escape } from '/js/ui.js';
+  import { get, post, del } from '/js/api.js';
+
+  const session = requireAuth();
+  const main = renderShell({ section: 'me', currentPath: '/me/data' });
+
+  main.innerHTML = pageHead({
+    crumb: 'Account / My Data',
+    title: '<em>Your</em> data',
+    description: 'Export, review, and erase the personal data we hold on your behalf. Subject access rights under GDPR Article 15 and 17.',
+  }) + `
+    <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5)">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="t-h2">Download my data</div>
+            <div class="t-small mt-1">A signed JSON archive containing every record tied to your account.</div>
+          </div>
+        </div>
+        <div class="card-body">
+          <ul class="t-body" style="padding-left:1.2em;line-height:1.8">
+            <li>Profile attributes (username, email, role, created date)</li>
+            <li>Registered devices with last-seen timestamps</li>
+            <li>Login history and risk decisions</li>
+            <li>MFA enrolment metadata (no shared secrets)</li>
+            <li>WebAuthn credential public keys (no private keys exist)</li>
+            <li>Audit log entries linked to your account</li>
+          </ul>
+          <div class="t-small text-fg-2 mt-4">Note: cryptographic hashes of audit entries on Hyperledger Fabric remain immutable — your PII is redacted but the chain of custody is preserved for fraud-prevention obligations.</div>
+        </div>
+        <div class="card-foot">
+          <span>Article 15 · Right of access</span>
+          <button class="btn btn-primary" id="export">Generate &amp; download</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="t-h2">Erase my account</div>
+            <div class="t-small mt-1">All PII deleted from operational stores; audit chain entries become tombstones.</div>
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="padding:var(--s-3);border:1px solid var(--line-strong);border-left:2px solid var(--deny);border-radius:var(--radius);background:var(--deny-soft);color:var(--fg-0);font-size:13px">
+            This is permanent. You cannot sign in afterwards, and we cannot restore the data later if you change your mind.
+          </div>
+          <ul class="t-body mt-4" style="padding-left:1.2em;line-height:1.8">
+            <li>All sessions are revoked immediately</li>
+            <li>Profile, devices, MFA, WebAuthn keys are deleted</li>
+            <li>Audit records on Fabric are redacted: PII fields hashed, decision metadata retained</li>
+            <li>You receive a confirmation email with the redaction transaction hash</li>
+          </ul>
+        </div>
+        <div class="card-foot">
+          <span>Article 17 · Right to erasure</span>
+          <button class="btn btn-danger" id="erase">Erase my account…</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-5">
+      <div class="card-head"><div class="t-h2">Data residency &amp; processors</div></div>
+      <div class="card-body">
+        <dl>
+          <div class="detail-row"><dt>Primary region</dt><dd id="region">—</dd></div>
+          <div class="detail-row"><dt>Data classification</dt><dd>Restricted (security operational data)</dd></div>
+          <div class="detail-row"><dt>Sub-processors</dt><dd>None — single-region operation. Cryptographic anchoring uses public timestamping (OpenTimestamps).</dd></div>
+          <div class="detail-row"><dt>Retention</dt><dd>Audit decisions: 7 years · Session data: 90 days post-revocation · Profile: account lifetime</dd></div>
+        </dl>
+      </div>
+    </div>`;
+
+  const $ = (s) => document.querySelector(s);
+
+  // Region pulled from session metadata if available
+  const region = session.region || session.user?.region || 'eu-central-1 (default)';
+  $('#region').textContent = region;
+
+  $('#export').addEventListener('click', async () => {
+    const btn = $('#export');
+    btn.disabled = true; btn.textContent = 'Preparing archive…';
+    try {
+      const blob = await get('/api/me/export', { expect: 'blob' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `ztiam-${session.username || 'me'}-${Date.now()}.json`;
+      a.click();
+      toast('Archive downloaded', 'success');
+    } catch (e) { toast(e.message, 'error'); }
+    finally { btn.disabled = false; btn.textContent = 'Generate & download'; }
+  });
+
+  $('#erase').addEventListener('click', async () => {
+    const ok = await confirm({
+      title: 'Erase your account?',
+      body: `Type <b>DELETE</b> in the field below to confirm. This action is irreversible.<br><br>
+        <input class="input mono mt-2" id="erase-confirm" placeholder="DELETE" autocomplete="off">`,
+      danger: true, confirmLabel: 'Erase forever',
+    });
+    if (!ok) return;
+    const text = document.getElementById('erase-confirm')?.value;
+    if (text !== 'DELETE') {
+      // user typed wrong text; the confirmation modal already closed, so re-prompt
+      toast('You must type DELETE exactly to confirm', 'error');
+      return;
+    }
+    try {
+      await del('/api/me/account');
+      toast('Account erased. Redirecting…', 'success');
+      setTimeout(() => { sessionStorage.clear(); location.href = '/'; }, 1200);
+    } catch (e) { toast(e.message, 'error'); }
+  });
+</script>
+</body>
+</html>

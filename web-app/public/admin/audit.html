@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Audit Log · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireRole } from '/js/auth.js';
+  import { renderShell, pageHead, decisionPill, riskGauge, hashCopy, fmtTime, fmtRelative, toast, escape } from '/js/ui.js';
+  import { get, post } from '/js/api.js';
+
+  requireRole('admin');
+  const main = renderShell({ section: 'admin', currentPath: '/admin/audit' });
+  main.innerHTML = pageHead({
+    crumb: 'Governance / Audit',
+    title: '<em>Audit</em> log',
+    description: 'Every access decision recorded on Hyperledger Fabric. Filter, expand, and label entries to feed the ML training loop.',
+    actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>
+              <button class="btn btn-primary" id="export">Export CSV</button>`,
+  }) + `
+    <div class="filters">
+      <div class="field">
+        <label class="field-label" for="f-user">User</label>
+        <input class="input" id="f-user" placeholder="username or sub">
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-decision">Decision</label>
+        <select class="select" id="f-decision">
+          <option value="">All</option>
+          <option value="ALLOW">ALLOW</option>
+          <option value="STEP_UP">STEP_UP</option>
+          <option value="DENY">DENY</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-from">From</label>
+        <input class="input" id="f-from" type="datetime-local">
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-to">To</label>
+        <input class="input" id="f-to" type="datetime-local">
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-min">Min risk</label>
+        <input class="input" id="f-min" type="number" step="0.05" min="0" max="1" placeholder="0.00">
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-max">Max risk</label>
+        <input class="input" id="f-max" type="number" step="0.05" min="0" max="1" placeholder="1.00">
+      </div>
+      <div class="field-actions">
+        <button class="btn btn-secondary" id="apply">Apply</button>
+        <button class="btn btn-ghost" id="clear">Clear</button>
+      </div>
+    </div>
+
+    <div id="result"></div>`;
+
+  const $ = (s) => document.querySelector(s);
+  const result = $('#result');
+  let allRows = [];
+  let sortKey = 'timestamp', sortDir = 'desc';
+
+  async function load() {
+    result.innerHTML = `<div class="empty"><p>Loading audit entries…</p></div>`;
+    try {
+      const data = await get('/api/admin/audit');
+      allRows = Array.isArray(data) ? data : (data.entries || data.rows || []);
+      render();
+    } catch (err) {
+      result.innerHTML = `<div class="empty"><h3>Couldn't load audit log</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function applyFilters(rows) {
+    const user = $('#f-user').value.trim().toLowerCase();
+    const dec = $('#f-decision').value;
+    const from = $('#f-from').value ? new Date($('#f-from').value).getTime() : null;
+    const to = $('#f-to').value ? new Date($('#f-to').value).getTime() : null;
+    const minR = $('#f-min').value === '' ? null : parseFloat($('#f-min').value);
+    const maxR = $('#f-max').value === '' ? null : parseFloat($('#f-max').value);
+    return rows.filter((r) => {
+      if (user && !((r.userId || r.user || '').toLowerCase().includes(user))) return false;
+      if (dec && r.decision !== dec) return false;
+      const t = new Date(r.timestamp || r.ts || 0).getTime();
+      if (from && t < from) return false;
+      if (to && t > to) return false;
+      const risk = Number(r.riskScore ?? r.risk_score ?? r.risk);
+      if (minR != null && Number.isFinite(risk) && risk < minR) return false;
+      if (maxR != null && Number.isFinite(risk) && risk > maxR) return false;
+      return true;
+    });
+  }
+
+  function sortRows(rows) {
+    const dir = sortDir === 'asc' ? 1 : -1;
+    return [...rows].sort((a, b) => {
+      const av = a[sortKey] ?? a[sortKey === 'riskScore' ? 'risk_score' : sortKey];
+      const bv = b[sortKey] ?? b[sortKey === 'riskScore' ? 'risk_score' : sortKey];
+      if (sortKey === 'timestamp') return (new Date(av).getTime() - new Date(bv).getTime()) * dir;
+      if (typeof av === 'number') return (av - bv) * dir;
+      return String(av || '').localeCompare(String(bv || '')) * dir;
+    });
+  }
+
+  function render() {
+    const rows = sortRows(applyFilters(allRows));
+    if (!rows.length) {
+      result.innerHTML = `<div class="empty"><h3>No matching entries</h3><p>Adjust filters or wait for new traffic.</p></div>`;
+      return;
+    }
+    result.innerHTML = `
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th class="sortable ${sortKey==='timestamp'?'sort-'+sortDir:''}" data-sort="timestamp">When</th>
+              <th class="sortable ${sortKey==='userId'?'sort-'+sortDir:''}" data-sort="userId">User</th>
+              <th>Decision</th>
+              <th class="sortable ${sortKey==='riskScore'?'sort-'+sortDir:''}" data-sort="riskScore">Risk</th>
+              <th>Reason</th>
+              <th>Resource</th>
+              <th>Tx</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((r, i) => rowHtml(r, i)).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="t-small text-fg-2 mt-3">${rows.length} of ${allRows.length} entries · sorted by ${sortKey} ${sortDir}</div>
+    `;
+    bindRows(rows);
+  }
+
+  function rowHtml(r, i) {
+    const ts = r.timestamp || r.ts;
+    const auditId = r.auditId || r.txId || r.id;
+    const risk = r.riskScore ?? r.risk_score;
+    const proofHash = r.proofHash || r.proof_hash;
+    return `
+      <tr data-i="${i}" data-id="${escape(auditId || '')}">
+        <td>
+          <div>${escape(fmtRelative(ts))}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(ts))}</div>
+        </td>
+        <td>${escape(r.userId || r.user || '—')}</td>
+        <td>${decisionPill(r.decision)}</td>
+        <td class="num">${risk != null ? riskGauge(risk) : (proofHash ? '<span class="pill muted pill-no-dot">redacted (zkp)</span>' : '—')}</td>
+        <td><span class="t-small">${escape(r.reason || '—')}</span></td>
+        <td><span class="t-mono">${escape(r.resource || 'default')}</span></td>
+        <td>${hashCopy(r.txId)}</td>
+        <td><button class="btn btn-ghost btn-sm" data-act="expand">Details</button></td>
+      </tr>`;
+  }
+
+  function detailHtml(r) {
+    const proofHash = r.proofHash || r.proof_hash;
+    const ml = r.mlExplanation || r.ml_explanation || r.explanation;
+    const anomaly = r.anomalyFactors || r.anomaly_factors;
+    return `
+      <tr class="row-detail">
+        <td colspan="8">
+          <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5)">
+            <div>
+              <div class="t-h3 mb-3">Cryptographic evidence</div>
+              <dl>
+                <div class="detail-row"><dt>Proof hash</dt><dd>${proofHash ? hashCopy(proofHash, { length: 24 }) : '<span class="t-mono text-fg-2">none</span>'}</dd></div>
+                <div class="detail-row"><dt>ZKP scheme</dt><dd class="t-mono">${escape(r.zkpScheme || 'PedersenBitRangeProof')}</dd></div>
+                <div class="detail-row"><dt>Model version</dt><dd class="t-mono">${escape(r.modelVersion || '—')}</dd></div>
+                <div class="detail-row"><dt>Policy version</dt><dd class="t-mono">${escape(r.policyVersion || '—')}</dd></div>
+                <div class="detail-row"><dt>Tx ID</dt><dd>${hashCopy(r.txId, { length: 32 })}</dd></div>
+              </dl>
+            </div>
+            <div>
+              <div class="t-h3 mb-3">Risk decomposition</div>
+              <dl>
+                ${r.ahpScore != null ? `<div class="detail-row"><dt>AHP</dt><dd>${riskGauge(r.ahpScore)}</dd></div>` : ''}
+                ${r.mlScore != null ? `<div class="detail-row"><dt>ML</dt><dd>${riskGauge(r.mlScore)}</dd></div>` : ''}
+                ${r.anomalyScore != null ? `<div class="detail-row"><dt>Anomaly</dt><dd>${riskGauge(r.anomalyScore)}</dd></div>` : ''}
+              </dl>
+              ${ml && Array.isArray(ml) ? `
+                <div class="t-h3 mt-4 mb-3">Top ML features</div>
+                <table class="table" style="background:transparent">
+                  <tbody>
+                    ${ml.slice(0, 5).map((f) => `
+                      <tr>
+                        <td class="t-mono">${escape(f.feature || f.name)}</td>
+                        <td class="num t-mono">${escape((f.value ?? '').toString().slice(0, 8))}</td>
+                        <td class="num t-mono text-fg-2">${escape(((f.contribution ?? f.importance ?? 0)).toFixed(3))}</td>
+                      </tr>`).join('')}
+                  </tbody>
+                </table>` : ''}
+              ${anomaly ? `<div class="t-small text-fg-2 mt-3">Anomaly factors: <span class="t-mono">${escape(typeof anomaly === 'string' ? anomaly : JSON.stringify(anomaly))}</span></div>` : ''}
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-5 justify-end">
+            <span class="t-small text-fg-2 flex items-center" style="margin-right:auto">Mark this decision to feed the ML training set</span>
+            <button class="btn btn-secondary" data-fb="false_positive">False positive</button>
+            <button class="btn btn-secondary" data-fb="true_positive">True positive</button>
+          </div>
+        </td>
+      </tr>`;
+  }
+
+  function bindRows(rows) {
+    document.querySelectorAll('th.sortable').forEach((th) => {
+      th.addEventListener('click', () => {
+        const k = th.dataset.sort;
+        if (sortKey === k) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        else { sortKey = k; sortDir = 'desc'; }
+        render();
+      });
+    });
+    document.querySelectorAll('button[data-act=expand]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const tr = btn.closest('tr');
+        const i = Number(tr.dataset.i);
+        const next = tr.nextElementSibling;
+        if (next && next.classList.contains('row-detail')) {
+          next.remove();
+          tr.classList.remove('expanded');
+          btn.textContent = 'Details';
+          return;
+        }
+        tr.classList.add('expanded');
+        btn.textContent = 'Hide';
+        tr.insertAdjacentHTML('afterend', detailHtml(rows[i]));
+        const detail = tr.nextElementSibling;
+        detail.querySelectorAll('button[data-fb]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const auditId = tr.dataset.id;
+            try {
+              await post(`/api/admin/audit/${encodeURIComponent(auditId)}/feedback`, {
+                label: b.dataset.fb,
+              });
+              toast('Feedback recorded · sample relabelled', 'success');
+            } catch (err) { toast(err.message, 'error'); }
+          });
+        });
+      });
+    });
+  }
+
+  $('#refresh').addEventListener('click', load);
+  $('#apply').addEventListener('click', render);
+  $('#clear').addEventListener('click', () => {
+    document.querySelectorAll('.filters input, .filters select').forEach((el) => el.value = '');
+    render();
+  });
+  $('#export').addEventListener('click', () => {
+    const rows = applyFilters(allRows);
+    const csv = ['timestamp,user,decision,risk,reason,resource,txId']
+      .concat(rows.map((r) => [
+        r.timestamp || r.ts, r.userId || r.user, r.decision,
+        r.riskScore ?? r.risk_score ?? '', JSON.stringify(r.reason || ''),
+        r.resource || 'default', r.txId || ''
+      ].join(','))).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'audit-' + Date.now() + '.csv'; a.click();
+  });
+
+  load();
+</script>
+</body>
+</html>

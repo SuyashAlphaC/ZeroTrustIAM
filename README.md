@@ -783,6 +783,8 @@ bash scripts/setup-network.sh
 bash scripts/deploy-chaincode.sh
 ```
 
+**Kubernetes:** manifests live under `k8s/`. Never apply `k8s/base/secrets-placeholder.yaml` to production clusters as-is — use Sealed Secrets (`scripts/seal-secrets.sh` + `k8s/base/secrets-sealed.example.yaml`) or External Secrets (`k8s/base/external-secret-vault.yaml`), then run **`kubectl apply -k k8s/overlays/production/`**.
+
 This starts 4 Docker containers:
 - `orderer.example.com` -- Transaction ordering (port 7050)
 - `peer0.org1.example.com` -- Endorsing peer (port 7051)

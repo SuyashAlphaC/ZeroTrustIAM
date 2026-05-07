@@ -203,6 +203,14 @@ const schemas = {
     }).optional(),
   }),
 
+  // POST /v1/audit/:auditId/feedback (analyst ground-truth label)
+  auditFeedback: Joi.object({
+    label: Joi.string()
+      .valid('true_positive', 'false_positive', 'true_negative', 'false_negative')
+      .required(),
+    notes: Joi.string().max(1000).optional(),
+  }),
+
   // User registration
   createUser: Joi.object({
     userId: Joi.string().alphanum().min(2).max(50).required(),

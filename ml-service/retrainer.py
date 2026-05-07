@@ -3,8 +3,10 @@ Orchestrates training runs using only accumulated real samples drawn from the
 live dataset store.
 
 The retrain is executed synchronously (for a manual /train call) or from the
-APScheduler background thread. It writes the updated model to MODEL_DIR and
-invokes the provided reload_fn so the serving layer swaps models atomically.
+APScheduler background thread. It writes the updated model artefacts into
+``MODEL_DIR/candidate`` (champion/challenger workflow — Tier B.7); the active
+champion under ``MODEL_DIR`` is only swapped via promoter.promote_candidate.
+``reload_fn`` is therefore NOT invoked here.
 """
 
 from __future__ import annotations
@@ -16,6 +18,10 @@ import numpy as np
 
 from dataset import TrainingDataset
 from model import RandomForestRiskModel
+
+MIN_SAMPLES_FOR_TRAIN = int(os.environ.get("MIN_SAMPLES_FOR_TRAIN", "20"))
+
+
 def retrain(
     dataset: TrainingDataset,
     model_dir: str,
@@ -38,6 +44,12 @@ def retrain(
         if X_real.shape[0] == 0:
             raise RuntimeError("no training data: live dataset is empty")
 
+        if X_real.shape[0] < MIN_SAMPLES_FOR_TRAIN:
+            raise RuntimeError(
+                f"not enough labeled samples ({X_real.shape[0]}); need >= {MIN_SAMPLES_FOR_TRAIN} "
+                "(MIN_SAMPLES_FOR_TRAIN)"
+            )
+
         X = X_real
         y = y_real
         sources: List[str] = [f"live:{X_real.shape[0]}"]
@@ -53,7 +65,9 @@ def retrain(
         metrics = model.train(X, y, sources=sources)
 
         os.makedirs(model_dir, exist_ok=True)
-        model.save(model_dir)
+        candidate_dir = os.path.join(model_dir, "candidate")
+        os.makedirs(candidate_dir, exist_ok=True)
+        model.save(candidate_dir)
 
         dataset.record_retrain_finish(
             run_id=run_id,
@@ -62,13 +76,9 @@ def retrain(
             training_sources=sources,
         )
 
-        if reload_fn is not None:
-            try:
-                reload_fn()
-            except Exception:
-                # A reload failure doesn't invalidate the trained artefacts on
-                # disk — they will be picked up on the next process start.
-                pass
+        # NOTE: reload_fn is intentionally NOT called for candidate writes.
+        # Promotion is gated by promoter.compare_models / promote_candidate.
+        _ = reload_fn  # kept in signature for backward compatibility
 
         return {
             "accuracy": float(metrics["accuracy"]),
@@ -78,6 +88,7 @@ def retrain(
             "n_synthetic": 0,
             "training_sources": sources,
             "top_features": model.top_features(8),
+            "candidate_dir": candidate_dir,
         }
     except Exception as exc:
         dataset.record_retrain_error(run_id, str(exc))

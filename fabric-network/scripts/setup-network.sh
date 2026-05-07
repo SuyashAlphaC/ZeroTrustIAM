@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NETWORK_DIR="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="${NETWORK_DIR}/bin"
 export PATH="${BIN_DIR}:${PATH}"
+if ! command -v cryptogen >/dev/null 2>&1; then
+  echo "FATAL: cryptogen not in PATH. Install Hyperledger Fabric binaries first." >&2
+  exit 1
+fi
 export FABRIC_CFG_PATH="${NETWORK_DIR}"
 
 echo "============================================"
@@ -12,18 +16,30 @@ echo "  Zero Trust IAM - Fabric Network Setup"
 echo "============================================"
 echo ""
 
-# Step 1: Clean up any previous state
+# Step 1: Clean up volatile state while preserving MSP material when org2 already bootstrapped
 echo "[1/7] Cleaning up previous state..."
 cd "${NETWORK_DIR}"
+ORG2MSP="${NETWORK_DIR}/organizations/peerOrganizations/org2.example.com"
+EXISTING_CRYPTO=0
+[[ -d "${ORG2MSP}" ]] && EXISTING_CRYPTO=1
 docker compose down -v 2>/dev/null || true
-rm -rf organizations channel-artifacts/*.block
+if [[ "${EXISTING_CRYPTO}" -eq 0 ]]; then
+  rm -rf organizations channel-artifacts/*.block
+else
+  mkdir -p channel-artifacts
+  echo "  Existing crypto under organizations/ retained (Org2 MSP present)."
+fi
 
-# Step 2: Generate crypto material
+# Step 2: Generate crypto material when missing
 echo "[2/7] Generating crypto material..."
-cryptogen generate --config=crypto-config-orderer.yaml --output=organizations
-cryptogen generate --config=crypto-config-org1.yaml --output=organizations
-cryptogen generate --config=crypto-config-org2.yaml --output=organizations
-echo "  Crypto material generated."
+if [[ "${EXISTING_CRYPTO}" -eq 0 ]]; then
+  cryptogen generate --config=crypto-config-orderer.yaml --output=organizations
+  cryptogen generate --config=crypto-config-org1.yaml --output=organizations
+  cryptogen generate --config=crypto-config-org2.yaml --output=organizations
+  echo "  Crypto material generated."
+else
+  echo "  Skipping cryptogen (organizations/ already populated)."
+fi
 
 # Step 3: Generate genesis block for channel
 echo "[3/7] Generating channel genesis block..."

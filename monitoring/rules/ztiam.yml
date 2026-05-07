@@ -51,6 +51,26 @@ groups:
           summary: "Fewer than 100 labeled training samples"
           description: "Only {{ $value }} samples in dataset. ML model accuracy may be low."
 
+      - alert: MlFeatureDriftMinor
+        expr: max(ml_feature_drift_psi) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Feature drift PSI > 0.2"
+          description: "At least one ML feature has PSI {{ $value }} (minor drift). Inspect /drift and consider a retrain."
+
+      - alert: MlFeatureDriftCritical
+        expr: max(ml_feature_drift_psi) > 0.25
+        for: 15m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Feature drift PSI > 0.25"
+          description: "At least one ML feature has PSI {{ $value }} (critical drift). Model predictions may be unreliable; retrain or rollback."
+
   - name: ztiam-policy-engine-alerts
     rules:
       - alert: PolicyEngineDown

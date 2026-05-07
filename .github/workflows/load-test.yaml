@@ -1,0 +1,25 @@
+name: Load test (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  k6-burst:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spin up Compose stack (best-effort)
+        run: |
+          docker compose up -d || true
+          sleep 20
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo apt-get update && sudo apt-get install -y ca-certificates curl
+          sudo curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+      - name: Run burst profile
+        env:
+          PE_URL: http://127.0.0.1:4000
+        run: k6 run load-tests/k6/login-burst.js

@@ -44,9 +44,14 @@ Prometheus scrapes policy-engine **`/metrics` over HTTPS** with `insecure_skip_v
 
 ## Kubernetes
 
-Manifests live under **`k8s/`** (`kubectl apply -k k8s/`). Replace **`k8s/base/secrets-placeholder.yaml`** with externally managed Secrets (SealedSecrets, External Secrets Operator, Vault CSI, etc.) before production.
+Manifests live under **`k8s/`** (`kubectl apply -k k8s/`). **Do not** apply `secrets-placeholder.yaml` as-is in production — it contains development placeholders. Use `kubectl apply -k k8s/overlays/production/` with either a **SealedSecret** (via `scripts/seal-secrets.sh` + `secrets-sealed.example.yaml`) or **ExternalSecret** (`external-secret-vault.yaml`) wired to your secret store.
 
-## ML training data
+## Resilience testing
+
+- **Fabric Raft / orderer failure:** In a full local network, run **`fabric-network/scripts/chaos-orderer-kill.sh`** weekly in staging. It stops primary orderer `orderer.example.com`, waits for leadership to shift, exercises a policy-engine transaction via **`submit-test-tx.sh`**, then restores the node and re-validates. Keeps the three-orderer Raft path from bit-rotting.
+- **Kubernetes / app layer:** Use the optional GitHub workflow **`.github/workflows/load-test.yaml`** (manual `workflow_dispatch`) with **`k6`** against a compose or preview stack to validate HPA targets and golden-signal latency under burst login load.
+
+---
 
 The ml-service enforces:
 

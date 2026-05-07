@@ -1,0 +1,37 @@
+# Daily logical backups + continuous WAL archiving for the ztiam-pg cluster.
+#
+# Production:
+#   ScheduledBackup uses the cluster.spec.backup.barmanObjectStore (S3) defined
+#   in cnpg-cluster.yaml. Configure the destinationPath/credentials there.
+#
+# Dev / single-node:
+#   The PVC `ztiam-pg-backups` (50Gi) below is created so a NodePort/PVC backup
+#   target can be wired in by an overlay. The simplest dev path is to leave the
+#   ScheduledBackup as below and point barmanObjectStore.destinationPath at a
+#   MinIO instance running in-cluster, OR keep using the legacy
+#   postgres-backup-cronjob.yaml against the ztiam-pg-rw service.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ztiam-pg-backups
+  namespace: ztiam
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: ztiam-pg-daily
+  namespace: ztiam
+spec:
+  schedule: "0 0 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: ztiam-pg
+  immediate: false
+  suspend: false
+  method: barmanObjectStore

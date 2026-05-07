@@ -1,0 +1,105 @@
+# CloudNativePG-managed Postgres cluster (replaces the single-pod Deployment in postgres.yaml).
+# Operator docs: https://cloudnative-pg.io/
+# Prerequisite (install once per cluster):
+#   kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.0.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ztiam-pg
+  namespace: ztiam
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9187"
+    prometheus.io/path: "/metrics"
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.3
+  primaryUpdateStrategy: unsupervised
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      wal_level: "replica"
+      max_wal_size: "2GB"
+      hot_standby: "on"
+      log_min_duration_statement: "1000"
+  bootstrap:
+    initdb:
+      database: ztiam
+      owner: ztiam
+      secret:
+        name: ztiam-pg-app
+  superuserSecret:
+    name: ztiam-pg-superuser
+  storage:
+    size: 20Gi
+    storageClass: ""
+  walStorage:
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  monitoring:
+    enablePodMonitor: true
+    customQueriesConfigMap: []
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://CHANGEME-bucket/ztiam-pg"
+      endpointURL: ""
+      s3Credentials:
+        accessKeyId:
+          name: ztiam-pg-backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: ztiam-pg-backup-creds
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 2
+    retentionPolicy: "30d"
+---
+# App-user secret (consumed by bootstrap.initdb.secret).
+# Production: replace via ExternalSecret (see external-secret-vault.yaml) or kubeseal.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ztiam-pg-app
+  namespace: ztiam
+type: kubernetes.io/basic-auth
+stringData:
+  username: ztiam
+  password: replace-me
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ztiam-pg-superuser
+  namespace: ztiam
+type: kubernetes.io/basic-auth
+stringData:
+  username: postgres
+  password: replace-me-superuser
+---
+# Placeholder S3 credentials. In dev these are unused (PVC-based backups via
+# postgres-backup-cronjob still apply). Production: provide via ExternalSecret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ztiam-pg-backup-creds
+  namespace: ztiam
+type: Opaque
+stringData:
+  ACCESS_KEY_ID: replace-me
+  SECRET_ACCESS_KEY: replace-me

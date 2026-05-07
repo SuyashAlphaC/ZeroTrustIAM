@@ -136,6 +136,7 @@ function ingestSample(userProfile, requestContext, opts = {}) {
     username: requestContext.username,
     decision: opts.decision,
     reason: opts.reason,
+    audit_id: opts.auditId || null,
   };
 
   const { getRequestId } = require('./requestContext');
@@ -151,6 +152,7 @@ function ingestSample(userProfile, requestContext, opts = {}) {
         'x-ml-service-token': config.mlServiceToken,
         ...(rid ? { 'x-request-id': rid } : {}),
       },
+      body: JSON.stringify(body),
     },
     config.mlServiceTimeoutMs * 2
   ).then(async (res) => {
@@ -161,6 +163,55 @@ function ingestSample(userProfile, requestContext, opts = {}) {
   }).catch((err) => {
     logger.debug({ err: err.message }, 'ML ingest failed (non-fatal)');
   });
+}
+
+/**
+ * Map analyst feedback labels to the supervised binary label expected by the
+ * ML service.
+ *  - true_positive  / false_negative -> 1 (attack)
+ *  - false_positive / true_negative  -> 0 (benign)
+ */
+function feedbackLabelToBinary(label) {
+  if (label === 'true_positive' || label === 'false_negative') return 1;
+  if (label === 'false_positive' || label === 'true_negative') return 0;
+  return null;
+}
+
+/**
+ * Forward an analyst feedback label to the ML service /relabel endpoint.
+ * Returns { ok, status, body? } — never throws.
+ */
+async function relabelMlSample({ auditId, label, reviewer }) {
+  if (!config.mlServiceEnabled) return { ok: false, status: 0, error: 'disabled' };
+  const binary = feedbackLabelToBinary(label);
+  if (binary === null) return { ok: false, status: 0, error: 'invalid_label' };
+  const { getRequestId } = require('./requestContext');
+  const rid = getRequestId();
+  try {
+    const res = await fetchWithTimeout(
+      `${config.mlServiceUrl}/relabel`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-ml-service-token': config.mlServiceToken,
+          ...(rid ? { 'x-request-id': rid } : {}),
+        },
+        body: JSON.stringify({ audit_id: auditId, label: binary, reviewer }),
+      },
+      config.mlServiceTimeoutMs * 2
+    );
+    let body = null;
+    try { body = await res.json(); } catch { /* non-json body is fine */ }
+    if (!res.ok) {
+      logger.warn({ status: res.status, auditId }, 'ML relabel returned non-OK');
+      return { ok: false, status: res.status, body };
+    }
+    return { ok: true, status: res.status, body };
+  } catch (err) {
+    logger.warn({ err: err.message, auditId }, 'ML relabel failed');
+    return { ok: false, status: 0, error: err.message };
+  }
 }
 
 async function mlHealth() {
@@ -177,4 +228,12 @@ async function mlHealth() {
   }
 }
 
-module.exports = { scoreWithML, mlHealth, toRiskRequest, ingestSample, deriveLabel };
+module.exports = {
+  scoreWithML,
+  mlHealth,
+  toRiskRequest,
+  ingestSample,
+  deriveLabel,
+  relabelMlSample,
+  feedbackLabelToBinary,
+};

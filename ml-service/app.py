@@ -27,6 +27,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, conint
 
+import drift
+import promoter
 from dataset import TrainingDataset
 from features import FEATURE_NAMES, FEATURE_VECTOR_VERSION, RiskRequest, extract_features
 from model import RandomForestRiskModel
@@ -69,6 +71,31 @@ _metrics: Dict[str, int] = {
 # Snapshot of sample count at the last successful retrain, used by the
 # scheduler to decide whether enough fresh data has accumulated.
 _last_retrain_sample_count: int = 0
+
+# Drift cache: (computed_at_epoch, payload). Re-used by /drift and /metrics.
+_DRIFT_CACHE_TTL_SEC = 300
+_drift_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
+
+
+def _validation_split(X, y, fraction: float = 0.15):
+    """Deterministic last-N% split used by /model/comparison."""
+    n = int(X.shape[0])
+    if n == 0:
+        return X, y
+    cut = max(int(n * (1.0 - fraction)), 0)
+    return X[cut:], y[cut:]
+
+
+def _get_drift_payload() -> Dict[str, Any]:
+    """Return cached drift result; recompute if stale."""
+    now = time.time()
+    payload = _drift_cache.get("payload")
+    if payload is not None and (now - _drift_cache.get("ts", 0.0)) < _DRIFT_CACHE_TTL_SEC:
+        return payload
+    payload = drift.compute_drift(_dataset)
+    _drift_cache["ts"] = now
+    _drift_cache["payload"] = payload
+    return payload
 
 
 def _require_service_token(x_ml_service_token: Optional[str]) -> None:
@@ -324,6 +351,53 @@ def train(
         raise HTTPException(status_code=500, detail=f"Retrain failed: {exc}")
 
 
+@app.get("/model/comparison")
+def model_comparison() -> Dict[str, Any]:
+    """Score the current candidate against the champion on a held-out validation set."""
+    candidate_dir = os.path.join(MODEL_DIR, promoter.CANDIDATE_DIRNAME)
+    if not os.path.isdir(candidate_dir):
+        raise HTTPException(status_code=404, detail="no candidate model present")
+    X, y = _dataset.fetch_all()
+    if X.shape[0] == 0:
+        raise HTTPException(status_code=400, detail="no validation data available")
+    X_val, y_val = _validation_split(X, y)
+    if len(set(y_val.tolist())) < 2:
+        raise HTTPException(
+            status_code=400, detail="validation split has only one class"
+        )
+    try:
+        return promoter.compare_models(MODEL_DIR, candidate_dir, X_val, y_val)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/model/promote")
+def model_promote(
+    x_ml_service_token: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_service_token(x_ml_service_token)
+    promoted = promoter.promote_candidate(MODEL_DIR)
+    if promoted:
+        _load_model()
+    return {"promoted": bool(promoted)}
+
+
+@app.post("/model/rollback")
+def model_rollback(
+    x_ml_service_token: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _require_service_token(x_ml_service_token)
+    rolled_back = promoter.rollback(MODEL_DIR)
+    if rolled_back:
+        _load_model()
+    return {"rolled_back": bool(rolled_back)}
+
+
+@app.get("/drift")
+def feature_drift() -> Dict[str, Any]:
+    return _get_drift_payload()
+
+
 @app.get("/dataset/stats")
 def dataset_stats() -> Dict[str, Any]:
     stats = _dataset.stats()
@@ -367,4 +441,19 @@ def metrics() -> str:
         "# TYPE ml_model_loaded gauge",
         f"ml_model_loaded {1 if _model is not None else 0}",
     ]
+
+    try:
+        drift_payload = _get_drift_payload()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("drift metric computation failed: %s", exc)
+        drift_payload = {"features": {}}
+
+    drift_features = drift_payload.get("features") or {}
+    if drift_features:
+        lines.append("# HELP ml_feature_drift_psi PSI per feature (recent vs baseline window)")
+        lines.append("# TYPE ml_feature_drift_psi gauge")
+        for name, psi in drift_features.items():
+            safe = str(name).replace('"', '')
+            lines.append(f'ml_feature_drift_psi{{feature="{safe}"}} {float(psi):.6f}')
+
     return "\n".join(lines) + "\n"

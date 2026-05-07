@@ -14,15 +14,17 @@ const { logger, requestLogger } = require('./logger');
 const db = require('./database');
 const { securityHeaders, globalLimiter, authLimiter, requireAuth, requireRole, validate, errorHandler } = require('./middleware');
 const { computeRiskScore, incrementFailedAttempts, resetFailedAttempts } = require('./riskScorer');
+const kmsSigner = require('./kmsSigner');
 const oauth = require('./oauth');
 const mfa = require('./mfa');
 const didResolver = require('./didResolver');
 const webauthn = require('./webauthn');
 const anomalyDetector = require('./anomalyDetector');
-const { scoreWithML, mlHealth, ingestSample } = require('./mlRiskScorer');
+const { scoreWithML, mlHealth, ingestSample, relabelMlSample } = require('./mlRiskScorer');
 const { computeEnsembleRisk } = require('./riskScorerEnsemble');
 const zkp = require('./zkpVerifier');
 const promMetrics = require('./metrics');
+const auditMirror = require('./auditMirror');
 
 const blockchain = require('./fabricClient');
 
@@ -83,17 +85,20 @@ app.use(globalLimiter);
 app.disable('x-powered-by');
 
 // ──────────────────────── Key Management ────────────────────────
+//
+// Access tokens (RS256) are minted via the `kmsSigner` abstraction so the
+// underlying key material can live in HashiCorp Vault Transit (or AWS KMS in
+// future) without ever entering Node's process memory. Refresh tokens stay
+// on a local HMAC secret stored in Postgres — the (lower-risk) refresh
+// secret moving to KMS is a follow-up. See policy-engine/docs/KMS.md.
 
-let JWT_SECRET, JWT_REFRESH_SECRET;
+let JWT_REFRESH_SECRET;
 
 async function initKeys() {
-  let jwtKey = await db.getActiveSigningKey('jwt');
-  if (!jwtKey) {
-    const secret = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
-    await db.storeSigningKey(`jwt-${Date.now()}`, 'jwt', secret, null, 'HS256');
-    jwtKey = await db.getActiveSigningKey('jwt');
-  }
-  JWT_SECRET = jwtKey.private_key;
+  // Warm up the KMS signer so the first request doesn't pay the init cost.
+  // For Vault Transit this round-trips to ${VAULT_ADDR}; failures here are
+  // surfaced explicitly by start() via kmsSigner.selfTest().
+  await kmsSigner.signJwt({ sub: '__warmup__', type: 'access' }, { expiresIn: '5s' }).catch(() => {});
 
   let refreshKey = await db.getActiveSigningKey('jwt_refresh');
   if (!refreshKey) {
@@ -104,22 +109,21 @@ async function initKeys() {
   JWT_REFRESH_SECRET = refreshKey.private_key;
 }
 
-function generateAccessToken(username, role) {
-  return jwt.sign(
+async function generateAccessToken(username, role) {
+  return kmsSigner.signJwt(
     { sub: username, role, type: 'access' },
-    JWT_SECRET,
     { expiresIn: config.jwtAccessExpiry, issuer: config.jwtIssuer }
   );
 }
 
-async function generateRefreshToken(username) {
+async function generateRefreshToken(username, opts = {}) {
   const token = jwt.sign(
     { sub: username, type: 'refresh', jti: crypto.randomUUID() },
     JWT_REFRESH_SECRET,
     { expiresIn: config.jwtRefreshExpiry, issuer: config.jwtIssuer }
   );
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-  await db.storeRefreshToken(token, username, expiresAt);
+  await db.storeRefreshToken(token, username, expiresAt, opts);
   return token;
 }
 
@@ -172,11 +176,12 @@ async function assessRequestRisk(userProfile, requestContext, requiredPermission
   };
 }
 
-function ingestObservedDecision(userProfile, requestContext, assessment, decision, reason) {
+function ingestObservedDecision(userProfile, requestContext, assessment, decision, reason, auditId) {
   ingestSample(userProfile, requestContext, {
     ...assessment.mlOpts,
     decision,
     reason,
+    auditId: auditId || null,
   });
 }
 
@@ -302,7 +307,7 @@ api.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       });
       await persistObservedLogin(username, requestContext, riskScore, 'DENY');
       await db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: 'DENY', reason: 'Risk too high', layer: 'Policy Engine' });
-      ingestObservedDecision(userProfile, requestContext, assessment, 'DENY', 'Risk too high');
+      ingestObservedDecision(userProfile, requestContext, assessment, 'DENY', 'Risk too high', blockchainResult.txId);
       promMetrics.inc('ztiam_decisions_total', { decision: 'DENY', layer: 'policy_engine', reason: 'risk_too_high' });
       promMetrics.inc('ztiam_ml_ingest_total', { label: '1' });
       return res.json({
@@ -328,7 +333,7 @@ api.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       if (preflightResult.decision !== 'ALLOW') {
         await persistObservedLogin(username, requestContext, riskScore, preflightResult.decision);
         await db.writeAuditLog({ txId: preflightResult.txId, userId: username, deviceId, riskScore, decision: preflightResult.decision, reason: preflightResult.reason, layer: preflightResult.layer });
-        ingestObservedDecision(userProfile, requestContext, assessment, preflightResult.decision, preflightResult.reason);
+        ingestObservedDecision(userProfile, requestContext, assessment, preflightResult.decision, preflightResult.reason, preflightResult.txId);
         promMetrics.inc('ztiam_decisions_total', { decision: preflightResult.decision, layer: 'chaincode' });
         promMetrics.inc('ztiam_ml_ingest_total', { label: preflightResult.decision === 'DENY' ? '1' : '0' });
         return res.json({
@@ -381,15 +386,25 @@ api.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
       resetFailedAttempts(username);
 
       // Step 6: Issue session tokens
-      const accessToken = generateAccessToken(username, userProfile.role);
+      const accessToken = await generateAccessToken(username, userProfile.role);
       const refreshToken = await generateRefreshToken(username);
 
       // Step 7: Record login
       await persistObservedLogin(username, requestContext, riskScore, 'ALLOW');
 
       await db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: 'ALLOW', reason: blockchainResult.reason, layer: blockchainResult.layer });
+      auditMirror.mirrorAuditEntry({
+        txId: blockchainResult.txId,
+        userId: username,
+        deviceId,
+        decision: 'ALLOW',
+        reason: blockchainResult.reason,
+        entryHash: blockchainResult.entryHash,
+        prevHash: blockchainResult.prevHash,
+        timestamp: requestContext.timestamp,
+      }).catch(() => {});
 
-      ingestObservedDecision(userProfile, requestContext, assessment, 'ALLOW', blockchainResult.reason);
+      ingestObservedDecision(userProfile, requestContext, assessment, 'ALLOW', blockchainResult.reason, blockchainResult.txId);
       promMetrics.inc('ztiam_decisions_total', { decision: 'ALLOW', layer: 'chaincode' });
       promMetrics.inc('ztiam_ml_ingest_total', { label: '0' });
 
@@ -409,7 +424,7 @@ api.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
     await db.recordLoginHistory(username, deviceId, location?.country, location?.city, requestContext.timestamp, riskScore, blockchainResult.decision);
     await db.writeAuditLog({ txId: blockchainResult.txId, userId: username, deviceId, riskScore, decision: blockchainResult.decision, reason: blockchainResult.reason, layer: blockchainResult.layer });
 
-    ingestObservedDecision(userProfile, requestContext, assessment, blockchainResult.decision, blockchainResult.reason);
+    ingestObservedDecision(userProfile, requestContext, assessment, blockchainResult.decision, blockchainResult.reason, blockchainResult.txId);
     promMetrics.inc('ztiam_decisions_total', { decision: blockchainResult.decision, layer: 'chaincode' });
     promMetrics.inc('ztiam_ml_ingest_total', { label: blockchainResult.decision === 'DENY' ? '1' : '0' });
 
@@ -426,13 +441,13 @@ api.post('/evaluate', authLimiter, validate('evaluate'), async (req, res, next) 
 
 // ──────────────────────── Token Endpoints ────────────────────────
 
-api.post('/verify-token', (req, res) => {
+api.post('/verify-token', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ valid: false, reason: 'No token provided' });
   }
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET, { issuer: config.jwtIssuer });
+    const decoded = await kmsSigner.verifyJwt(authHeader.split(' ')[1], { issuer: config.jwtIssuer });
     if (decoded.type !== 'access') return res.status(401).json({ valid: false, reason: 'Invalid token type' });
     res.json({ valid: true, user: decoded.sub, role: decoded.role, expiresAt: new Date(decoded.exp * 1000).toISOString() });
   } catch {
@@ -442,7 +457,26 @@ api.post('/verify-token', (req, res) => {
 
 api.post('/refresh-token', validate('refreshToken'), async (req, res) => {
   const { refreshToken } = req.body;
-  if (!await db.isRefreshTokenValid(refreshToken)) {
+  // Look up status BEFORE checking validity so we can detect reuse of a
+  // ROTATED/COMPROMISED token (RFC 6819 §5.2.2.3 family invalidation).
+  const tokenInfo = await db.getRefreshTokenStatus(refreshToken);
+  if (!tokenInfo) {
+    return res.status(401).json({ error: 'Invalid or revoked refresh token' });
+  }
+  if (tokenInfo.status === 'ROTATED' || tokenInfo.status === 'COMPROMISED') {
+    await db.markFamilyCompromised(tokenInfo.familyId, 'reuse_detected');
+    req.log.warn({
+      event: 'refresh_reuse_detected',
+      userId: tokenInfo.userId,
+      familyId: tokenInfo.familyId,
+      priorStatus: tokenInfo.status,
+    }, 'Refresh token reuse detected — family invalidated');
+    return res.status(401).json({
+      error: 'Token reuse detected',
+      code: 'REFRESH_REUSE_DETECTED',
+    });
+  }
+  if (tokenInfo.status !== 'ACTIVE') {
     return res.status(401).json({ error: 'Invalid or revoked refresh token' });
   }
   try {
@@ -450,10 +484,13 @@ api.post('/refresh-token', validate('refreshToken'), async (req, res) => {
     if (decoded.type !== 'refresh') return res.status(401).json({ error: 'Invalid token type' });
     const userProfile = await db.getUser(decoded.sub);
     if (!userProfile) return res.status(401).json({ error: 'User no longer exists' });
-    // Rotate: revoke old, issue new
-    await db.revokeRefreshToken(refreshToken);
-    const newAccessToken = generateAccessToken(decoded.sub, userProfile.role);
-    const newRefreshToken = await generateRefreshToken(decoded.sub);
+    // Rotate: mark old ROTATED, issue new in the same family with parent linkage.
+    const familyId = await db.markRefreshTokenRotated(refreshToken);
+    const newAccessToken = await generateAccessToken(decoded.sub, userProfile.role);
+    const newRefreshToken = await generateRefreshToken(decoded.sub, {
+      familyId: familyId || tokenInfo.familyId,
+      parentTokenHash: refreshToken,
+    });
     res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken, tokenExpiry: config.jwtAccessExpiry });
   } catch {
     await db.revokeRefreshToken(refreshToken);
@@ -744,7 +781,7 @@ api.post('/webauthn/login/verify', async (req, res, next) => {
     if (blockchainResult.decision === 'ALLOW') {
       resetFailedAttempts(username);
       await persistObservedLogin(username, requestContext, riskScore, 'ALLOW');
-      ingestObservedDecision(userProfile, requestContext, assessment, 'ALLOW', blockchainResult.reason);
+      ingestObservedDecision(userProfile, requestContext, assessment, 'ALLOW', blockchainResult.reason, blockchainResult.txId);
       promMetrics.inc('ztiam_decisions_total', { decision: 'ALLOW', layer: 'chaincode' });
       promMetrics.inc('ztiam_ml_ingest_total', { label: '0' });
       const accessToken = generateAccessToken(username, userProfile.role);
@@ -768,7 +805,7 @@ api.post('/webauthn/login/verify', async (req, res, next) => {
       });
     }
     await db.recordLoginHistory(username, requestContext.deviceId, requestContext.location?.country, requestContext.location?.city, requestContext.timestamp, riskScore, blockchainResult.decision);
-    ingestObservedDecision(userProfile, requestContext, assessment, blockchainResult.decision, blockchainResult.reason);
+    ingestObservedDecision(userProfile, requestContext, assessment, blockchainResult.decision, blockchainResult.reason, blockchainResult.txId);
     promMetrics.inc('ztiam_decisions_total', { decision: blockchainResult.decision, layer: 'chaincode' });
     promMetrics.inc('ztiam_ml_ingest_total', { label: blockchainResult.decision === 'DENY' ? '1' : '0' });
     res.json({
@@ -863,6 +900,59 @@ api.get('/admin/audit', requireAuth, requireRole('admin'), async (req, res, next
     }));
   } catch (err) { next(err); }
 });
+
+// ──────────────────────── Analyst feedback (Tier B.6) ────────────────────────
+
+api.post(
+  '/audit/:auditId/feedback',
+  requireAuth,
+  requireRole('admin'),
+  validate('auditFeedback'),
+  async (req, res, next) => {
+    try {
+      const { auditId } = req.params;
+      if (!auditId || auditId.length > 200) {
+        return res.status(400).json({ error: 'Invalid auditId' });
+      }
+      const recorded = await db.recordAuditFeedback({
+        auditId,
+        label: req.body.label,
+        reviewer: req.user.sub,
+        notes: req.body.notes,
+      });
+      // Best-effort relabel of the underlying ML training sample. A 404 from the
+      // ML side is fine — the sample may have been pruned by retraining.
+      let mlRelabel = null;
+      try {
+        mlRelabel = await relabelMlSample({
+          auditId,
+          label: req.body.label,
+          reviewer: req.user.sub,
+        });
+      } catch (err) {
+        req.log.warn({ err: err.message }, 'ML relabel call threw');
+      }
+      req.log.info({ auditId, label: req.body.label, reviewer: req.user.sub }, 'Audit feedback recorded');
+      res.status(201).json({ feedback: recorded, mlRelabel });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+api.get(
+  '/audit/:auditId/feedback',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const rows = await db.getAuditFeedback(req.params.auditId);
+      res.json({ auditId: req.params.auditId, feedback: rows });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // ──────────────────────── Audit Log (Blockchain) ────────────────────────
 

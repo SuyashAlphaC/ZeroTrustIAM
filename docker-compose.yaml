@@ -24,6 +24,7 @@ volumes:
   ml_service_models:
   postgres_data:
   grafana_data:
+  redis_data:
 
 services:
   postgres:
@@ -42,6 +43,21 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ztiam-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - ztiam
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   ml-service:

@@ -32,6 +32,22 @@ const INF = { inf: true };
 const G = { x: CURVE.Gx, y: CURVE.Gy };
 const H = deriveGeneratorH();
 
+/**
+ * Serialize a JSON-compatible value with deterministically-ordered keys.
+ * Required by the audit hash chain so the same logical entry yields the
+ * same hash regardless of insertion order.
+ */
+function canonicalJsonStringify(value) {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return '[' + value.map((v) => canonicalJsonStringify(v)).join(',') + ']';
+  }
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  const parts = keys.map((k) => JSON.stringify(k) + ':' + canonicalJsonStringify(value[k]));
+  return '{' + parts.join(',') + '}';
+}
+
 function mod(a, m = CURVE.P) {
   const r = a % m;
   return r >= 0n ? r : r + m;
@@ -355,6 +371,19 @@ class IAMContract extends Contract {
       });
     }
 
+    if (proofBacked) {
+      try {
+        await this._validateProofFreshness(ctx, userId, targetResource, proofPackage);
+      } catch (err) {
+        return this._logDecision(ctx, txId, userId, deviceId, riskScore, 'DENY', err.message, timestamp, {
+          modelVersion: activeModelVersion,
+          resource: targetResource,
+          policyId: params.policyId,
+          policyVersion: params.policyVersion,
+        });
+      }
+    }
+
     // All checks passed
     const grant = issueGrant
       ? await this._issueAccessGrant(ctx, {
@@ -385,7 +414,7 @@ class IAMContract extends Contract {
    * Log the access decision to the blockchain and return the result.
    */
   async _logDecision(ctx, txId, userId, deviceId, riskScore, decision, reason, timestamp, metadata = {}) {
-    const hasProof = metadata.riskProof && metadata.riskProof.valid;
+    const hasProof = Boolean(metadata.riskProof && metadata.riskProof.valid);
     const auditEntry = {
       txId,
       userId,
@@ -404,10 +433,18 @@ class IAMContract extends Contract {
       accessGrantId: metadata.accessGrant?.grantId,
     };
 
+    // Tamper-evident hash chain: link this entry to the previous one via SHA256.
+    const headBytes = await ctx.stub.getState('AuditChainHead');
+    const prevHash = headBytes && headBytes.length > 0 ? headBytes.toString() : 'GENESIS';
+    auditEntry.prevHash = prevHash;
+    const entryHash = this._canonicalHash({ ...auditEntry });
+    auditEntry.entryHash = entryHash;
+
     await ctx.stub.putState(
       `AuditLog:${txId}`,
       Buffer.from(JSON.stringify(auditEntry))
     );
+    await ctx.stub.putState('AuditChainHead', Buffer.from(entryHash));
 
     return JSON.stringify({
       decision,
@@ -417,7 +454,18 @@ class IAMContract extends Contract {
       policyVersion: metadata.policyVersion,
       modelVersion: metadata.modelVersion,
       accessGrant: metadata.accessGrant,
+      prevHash,
+      entryHash,
     });
+  }
+
+  /**
+   * Canonical (keys-sorted, recursively) SHA256 hex digest of a value.
+   * Used by the audit hash chain so that two entries with identical
+   * content but different key insertion order produce the same hash.
+   */
+  _canonicalHash(value) {
+    return crypto.createHash('sha256').update(canonicalJsonStringify(value)).digest('hex');
   }
 
   _parseOptionalJson(jsonValue) {
@@ -444,6 +492,35 @@ class IAMContract extends Contract {
 
   _hashJson(value) {
     return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  }
+
+  async _validateProofFreshness(ctx, userId, resource, proofPackage) {
+    const meta = (proofPackage && proofPackage.metadata) || null;
+    if (!meta || !meta.nonce || !meta.timestamp) {
+      return;
+    }
+    if (typeof meta.nonce !== 'string' || !/^[0-9a-fA-F]{16}$/.test(meta.nonce)) {
+      throw new Error('invalid_nonce');
+    }
+    const proofTimeMs = Date.parse(meta.timestamp);
+    if (Number.isNaN(proofTimeMs)) {
+      throw new Error('invalid_timestamp');
+    }
+    const ts = ctx.stub.getTxTimestamp();
+    const seconds = ts.seconds && ts.seconds.low !== undefined ? ts.seconds.low : ts.seconds;
+    const txTimeMs = Number(seconds) * 1000 + Math.floor((ts.nanos || 0) / 1e6);
+    if (txTimeMs - proofTimeMs > 300000) {
+      throw new Error('proof_too_old');
+    }
+    if (proofTimeMs - txTimeMs > 60000) {
+      throw new Error('proof_in_future');
+    }
+    const nonceKey = ctx.stub.createCompositeKey('Nonce', [userId, resource, meta.nonce]);
+    const existing = await ctx.stub.getState(nonceKey);
+    if (existing && existing.length > 0) {
+      throw new Error('nonce_replay');
+    }
+    await ctx.stub.putState(nonceKey, Buffer.from(JSON.stringify({ expiresAt: txTimeMs + 600000 })));
   }
 
   _validateRiskProof(proofPackage, params) {
@@ -622,6 +699,141 @@ class IAMContract extends Contract {
   }
 
   /**
+   * Return the current head of the audit hash chain (or 'GENESIS' if empty).
+   */
+  async GetAuditChainHead(ctx) {
+    const headBytes = await ctx.stub.getState('AuditChainHead');
+    return headBytes && headBytes.length > 0 ? headBytes.toString() : 'GENESIS';
+  }
+
+  /**
+   * Walk the audit hash chain from `fromTxId` (inclusive) to `toTxId` (inclusive)
+   * and verify that every entry's `entryHash` recomputes from its content + `prevHash`.
+   * Empty `fromTxId`/`toTxId` mean "start at the first entry"/"end at the last entry".
+   * Returns `{ valid, brokenAt, totalChecked }` JSON.
+   */
+  async VerifyAuditChain(ctx, fromTxId, toTxId) {
+    const iterator = await ctx.stub.getStateByRange('AuditLog:', 'AuditLog:~');
+    const entries = [];
+    try {
+      let result = await iterator.next();
+      while (!result.done) {
+        entries.push(JSON.parse(result.value.value.toString()));
+        result = await iterator.next();
+      }
+    } finally {
+      await iterator.close();
+    }
+
+    let started = !fromTxId;
+    let totalChecked = 0;
+    let brokenAt = null;
+    let valid = true;
+    let expectedPrev = null;
+
+    for (const entry of entries) {
+      if (!started) {
+        if (entry.txId === fromTxId) {
+          started = true;
+        } else {
+          continue;
+        }
+      }
+
+      // Recompute entryHash from the canonical content (excluding entryHash itself).
+      const { entryHash, ...rest } = entry;
+      const recomputed = this._canonicalHash(rest);
+      if (recomputed !== entryHash) {
+        valid = false;
+        brokenAt = entry.txId;
+        break;
+      }
+      // Verify chain link continuity once we have a previous hash to compare against.
+      if (expectedPrev !== null && entry.prevHash !== expectedPrev) {
+        valid = false;
+        brokenAt = entry.txId;
+        break;
+      }
+      expectedPrev = entryHash;
+      totalChecked += 1;
+
+      if (toTxId && entry.txId === toTxId) break;
+    }
+
+    return JSON.stringify({ valid, brokenAt, totalChecked });
+  }
+
+  /**
+   * Anchor a daily Merkle root computed off-chain by the policy engine.
+   * Org1 admin only and write-once per date — provides an external
+   * tamper-evidence checkpoint over the chained audit log.
+   */
+  async AnchorDailyRoot(ctx, date, merkleRoot) {
+    const mspId = ctx.clientIdentity.getMSPID();
+    if (mspId !== 'Org1MSP') {
+      throw new Error('unauthorized: MSP not permitted');
+    }
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      throw new Error('date must be YYYY-MM-DD');
+    }
+    if (!merkleRoot || typeof merkleRoot !== 'string') {
+      throw new Error('merkleRoot must be a non-empty string');
+    }
+    const existing = await ctx.stub.getState(`AuditDailyRoot:${date}`);
+    if (existing && existing.length > 0) {
+      throw new Error(`Daily root for ${date} already anchored`);
+    }
+    const record = {
+      date,
+      merkleRoot,
+      txId: ctx.stub.getTxID(),
+      anchoredAt: new Date().toISOString(),
+      anchoredBy: mspId,
+    };
+    await ctx.stub.putState(`AuditDailyRoot:${date}`, Buffer.from(JSON.stringify(record)));
+    return JSON.stringify(record);
+  }
+
+  async CleanupExpiredNonces(ctx) {
+    const mspId = ctx.clientIdentity.getMSPID();
+    if (mspId !== 'Org1MSP') {
+      throw new Error('unauthorized: MSP not permitted');
+    }
+    const ts = ctx.stub.getTxTimestamp();
+    const seconds = ts.seconds && ts.seconds.low !== undefined ? ts.seconds.low : ts.seconds;
+    const now = Number(seconds) * 1000 + Math.floor((ts.nanos || 0) / 1e6);
+    const iterator = await ctx.stub.getStateByPartialCompositeKey('Nonce', []);
+    let removed = 0;
+    while (true) {
+      const res = await iterator.next();
+      if (res.done) break;
+      try {
+        const entry = JSON.parse(res.value.value.toString());
+        if (typeof entry.expiresAt === 'number' && entry.expiresAt < now) {
+          await ctx.stub.deleteState(res.value.key.toString());
+          removed += 1;
+        }
+      } catch (_err) {
+        await ctx.stub.deleteState(res.value.key.toString());
+        removed += 1;
+      }
+    }
+    await iterator.close();
+    return JSON.stringify({ removed });
+  }
+
+  /**
+   * Read a previously-anchored daily Merkle root.
+   */
+  async GetDailyRoot(ctx, date) {
+    const recordBytes = await ctx.stub.getState(`AuditDailyRoot:${date}`);
+    if (!recordBytes || recordBytes.length === 0) {
+      throw new Error(`No daily root anchored for ${date}`);
+    }
+    return recordBytes.toString();
+  }
+
+  /**
    * Read a user record from the registry.
    */
   async GetUser(ctx, userId) {
@@ -649,6 +861,10 @@ class IAMContract extends Contract {
    * single-org prototype relies on Fabric endorsement policy for governance.
    */
   async UpdatePolicyPublicParams(ctx, paramsJson) {
+    const mspId = ctx.clientIdentity.getMSPID();
+    if (mspId !== 'Org1MSP') {
+      throw new Error('unauthorized: MSP not permitted');
+    }
     const current = await this._getPolicyPublicParams(ctx);
     const updates = JSON.parse(paramsJson);
     const next = {
@@ -986,3 +1202,23 @@ class IAMContract extends Contract {
 }
 
 module.exports = IAMContract;
+
+if (process.env.CHAINCODE_UNIT_TEST === '1') {
+  /** @internal EC helpers exposed only for deterministic Jest coverage. */
+  module.exports.testCrypto = {
+    mod,
+    modPow,
+    inv,
+    pointAdd,
+    pointMul,
+    pointEq,
+    encodePoint,
+    decodePoint,
+    deriveGeneratorH,
+    ceilLog2,
+    G,
+    INF,
+    CURVE,
+    H,
+  };
+}

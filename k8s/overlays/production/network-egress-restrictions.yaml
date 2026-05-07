@@ -1,0 +1,98 @@
+# Production-only egress hardening.
+#
+# The base/networkpolicies.yaml bundle already pins which in-cluster pods each
+# workload may reach. In production we additionally need to keep workloads off
+# the public internet except for an explicit allowlist (Vault HTTPS endpoint,
+# cloud KMS API, OpenTelemetry SaaS collector, etc).
+#
+# Two enforcement strategies:
+#
+#   1. ipBlock allowlists — works on any NetworkPolicy-aware CNI (Calico,
+#      Cilium, Weave). The CIDRs below are placeholders that an operator must
+#      replace with the real cloud-provider managed-service ranges (KMS, Vault
+#      Enterprise endpoints, OTel SaaS).
+#
+#   2. Cilium FQDN policies — preferred when Cilium is installed because the
+#      allowlist can be expressed by DNS name and updated automatically. If
+#      your cluster runs Cilium uncomment the CiliumNetworkPolicy at the
+#      bottom of this file and remove the ipBlock egress rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prod-egress-internet-allowlist
+  namespace: ztiam
+spec:
+  # Apply to every workload in the namespace; combined with the base
+  # default-deny-all this means egress is now: in-cluster allowlist (base) +
+  # this curated set of external CIDRs.
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Vault Enterprise / HCP Vault HTTPS endpoint — REPLACE with the actual
+    # /32 from `dig vault.example.com`.
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.10/32
+      ports:
+        - protocol: TCP
+          port: 8200
+    # Cloud KMS — example AWS KMS regional endpoint /24. REPLACE.
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    # OpenTelemetry SaaS collector — REPLACE.
+    - to:
+        - ipBlock:
+            cidr: 198.51.100.0/24
+      ports:
+        - protocol: TCP
+          port: 4318
+    # Block everything else by virtue of NOT listing it; the default-deny-all
+    # baseline policy in the base bundle still applies.
+---
+# Block egress to RFC1918 metadata services and link-local addresses that
+# could be used for SSRF or cloud-instance-metadata pivots. Documented as a
+# defence-in-depth rule on top of the allowlist above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prod-egress-block-metadata
+  namespace: ztiam
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            # Allow everything except link-local + IMDS ranges. The
+            # except-list is not bypassable because NetworkPolicy is additive
+            # and the base default-deny-all still applies.
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+# ---
+# Optional Cilium variant — uncomment if Cilium is the cluster CNI.
+# apiVersion: cilium.io/v2
+# kind: CiliumNetworkPolicy
+# metadata:
+#   name: prod-egress-fqdn-allowlist
+#   namespace: ztiam
+# spec:
+#   endpointSelector: {}
+#   egress:
+#     - toFQDNs:
+#         - matchName: vault.example.com
+#         - matchPattern: "*.kms.amazonaws.com"
+#         - matchName: otel.honeycomb.io
+#       toPorts:
+#         - ports:
+#             - port: "443"
+#               protocol: TCP
+#             - port: "4318"
+#               protocol: TCP

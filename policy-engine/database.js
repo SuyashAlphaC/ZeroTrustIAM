@@ -16,7 +16,7 @@ function getConnectionString() {
 }
 
 const MIGRATIONS = [{
-  name: '001_initial',
+  id: '001_initial',
   /** @param {import('pg').PoolClient} client */
   up: async (client) => {
     await client.query(`
@@ -226,6 +226,71 @@ const MIGRATIONS = [{
     await client.query('CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires ON oauth_codes(expires_at)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_expires ON webauthn_challenges(expires_at)');
   },
+  /** Non-trivial reverse of 001_initial: drops all application tables (not schema_migrations). */
+  down: async (client) => {
+    await client.query('DROP TABLE IF EXISTS webauthn_challenges CASCADE');
+    await client.query('DROP TABLE IF EXISTS webauthn_credentials CASCADE');
+    await client.query('DROP TABLE IF EXISTS access_grants CASCADE');
+    await client.query('DROP TABLE IF EXISTS local_audit_log CASCADE');
+    await client.query('DROP TABLE IF EXISTS login_history CASCADE');
+    await client.query('DROP TABLE IF EXISTS anomaly_profiles CASCADE');
+    await client.query('DROP TABLE IF EXISTS refresh_tokens CASCADE');
+    await client.query('DROP TABLE IF EXISTS devices CASCADE');
+    await client.query('DROP TABLE IF EXISTS mfa_challenges CASCADE');
+    await client.query('DROP TABLE IF EXISTS mfa_secrets CASCADE');
+    await client.query('DROP TABLE IF EXISTS verifiable_credentials CASCADE');
+    await client.query('DROP TABLE IF EXISTS did_documents CASCADE');
+    await client.query('DROP TABLE IF EXISTS oauth_codes CASCADE');
+    await client.query('DROP TABLE IF EXISTS oauth_clients CASCADE');
+    await client.query('DROP TABLE IF EXISTS signing_keys CASCADE');
+    await client.query('DROP TABLE IF EXISTS policy_public_params CASCADE');
+    await client.query('DROP TABLE IF EXISTS users CASCADE');
+  },
+}, {
+  id: '005_audit_feedback',
+  /** Analyst feedback on audit decisions — provides ground-truth labels to break the
+   *  ML self-reinforcement loop. Multiple reviewers per audit are allowed. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_feedback (
+        id SERIAL PRIMARY KEY,
+        audit_id TEXT NOT NULL,
+        label TEXT NOT NULL CHECK (label IN ('true_positive', 'false_positive', 'true_negative', 'false_negative')),
+        reviewer TEXT NOT NULL,
+        reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        notes TEXT,
+        UNIQUE(audit_id, reviewer)
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_feedback_audit_id ON audit_feedback(audit_id)');
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP TABLE IF EXISTS audit_feedback CASCADE');
+  },
+}, {
+  id: '006_refresh_token_families',
+  /** Refresh-token families enable RFC 6819 §5.2.2.3 reuse detection: rotated
+   *  tokens are kept (status='ROTATED'). Replaying any rotated/compromised
+   *  token in a family causes the entire family to be marked COMPROMISED. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query("ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE'");
+    await client.query('ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS family_id UUID');
+    await client.query('ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS parent_token_hash TEXT');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_refresh_family ON refresh_tokens(family_id)');
+    await client.query("UPDATE refresh_tokens SET family_id = gen_random_uuid() WHERE family_id IS NULL");
+    // Backfill status from the legacy `revoked` flag for tokens predating this column.
+    await client.query("UPDATE refresh_tokens SET status = 'REVOKED' WHERE revoked = 1 AND status = 'ACTIVE'");
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP INDEX IF EXISTS idx_refresh_family');
+    await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS parent_token_hash');
+    await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS family_id');
+    await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS status');
+  },
 }];
 
 async function init() {
@@ -244,9 +309,9 @@ async function init() {
     const { rows: appliedRows } = await client.query('SELECT name FROM schema_migrations');
     const applied = new Set(appliedRows.map((r) => r.name));
     for (const m of MIGRATIONS) {
-      if (applied.has(m.name)) continue;
+      if (applied.has(m.id)) continue;
       await m.up(client);
-      await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [m.name]);
+      await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [m.id]);
     }
     await client.query('COMMIT');
   } catch (e) {
@@ -314,24 +379,73 @@ async function getUserDevices(userId) {
   return rows;
 }
 
-async function storeRefreshToken(token, userId, expiresAt) {
-  await pool.query('INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES ($1, $2, $3)', [token, userId, expiresAt]);
+async function storeRefreshToken(token, userId, expiresAt, opts = {}) {
+  // family_id is generated server-side when omitted (new family on login). When
+  // a token rotates within a family, callers pass opts.familyId + opts.parentTokenHash.
+  const familyId = opts.familyId || null;
+  const parentHash = opts.parentTokenHash || null;
+  if (familyId) {
+    await pool.query(
+      `INSERT INTO refresh_tokens (token, user_id, expires_at, family_id, parent_token_hash, status)
+       VALUES ($1, $2, $3, $4, $5, 'ACTIVE')`,
+      [token, userId, expiresAt, familyId, parentHash]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO refresh_tokens (token, user_id, expires_at, family_id, parent_token_hash, status)
+       VALUES ($1, $2, $3, gen_random_uuid(), $4, 'ACTIVE')`,
+      [token, userId, expiresAt, parentHash]
+    );
+  }
 }
 
 async function isRefreshTokenValid(token) {
   const { rows: [row] } = await pool.query(
-    'SELECT * FROM refresh_tokens WHERE token = $1 AND revoked = 0 AND expires_at > NOW()',
+    "SELECT 1 FROM refresh_tokens WHERE token = $1 AND status = 'ACTIVE' AND expires_at > NOW()",
     [token]
   );
   return !!row;
 }
 
+async function getRefreshTokenStatus(token) {
+  const { rows: [row] } = await pool.query(
+    'SELECT status, family_id, user_id, expires_at FROM refresh_tokens WHERE token = $1',
+    [token]
+  );
+  if (!row) return null;
+  return {
+    status: row.status,
+    familyId: row.family_id,
+    userId: row.user_id,
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
+  };
+}
+
+async function markRefreshTokenRotated(token) {
+  const { rows: [row] } = await pool.query(
+    "UPDATE refresh_tokens SET status = 'ROTATED' WHERE token = $1 RETURNING family_id",
+    [token]
+  );
+  return row ? row.family_id : null;
+}
+
+async function markFamilyCompromised(familyId, reason) {
+  if (!familyId) return 0;
+  const { rowCount } = await pool.query(
+    "UPDATE refresh_tokens SET status = 'COMPROMISED' WHERE family_id = $1 AND status <> 'COMPROMISED'",
+    [familyId]
+  );
+  // reason is logged by the caller; persisted only via audit log.
+  void reason;
+  return rowCount;
+}
+
 async function revokeRefreshToken(token) {
-  await pool.query('UPDATE refresh_tokens SET revoked = 1 WHERE token = $1', [token]);
+  await pool.query("UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1 WHERE token = $1", [token]);
 }
 
 async function revokeAllUserTokens(userId) {
-  await pool.query('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = $1', [userId]);
+  await pool.query("UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1 WHERE user_id = $1", [userId]);
 }
 
 async function cleanExpiredTokens() {
@@ -814,6 +928,65 @@ async function createUserTx(client, { userId, password, role, usualCountry, usua
   }
 }
 
+// ──────────────────────── Analyst feedback (Tier B.6) ────────────────────────
+
+/**
+ * Record a reviewer's label for an audit entry. Reviewers are unique per audit_id —
+ * an existing review by the same reviewer is updated in place.
+ */
+async function recordAuditFeedback({ auditId, label, reviewer, notes }) {
+  const valid = new Set(['true_positive', 'false_positive', 'true_negative', 'false_negative']);
+  if (!valid.has(label)) {
+    throw new Error(`invalid feedback label: ${label}`);
+  }
+  const { rows: [row] } = await pool.query(
+    `INSERT INTO audit_feedback (audit_id, label, reviewer, notes)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (audit_id, reviewer) DO UPDATE SET
+       label = EXCLUDED.label, notes = EXCLUDED.notes, reviewed_at = NOW()
+     RETURNING id, audit_id, label, reviewer, reviewed_at, notes`,
+    [auditId, label, reviewer, notes ?? null]
+  );
+  return {
+    id: row.id,
+    auditId: row.audit_id,
+    label: row.label,
+    reviewer: row.reviewer,
+    reviewedAt: row.reviewed_at instanceof Date ? row.reviewed_at.toISOString() : row.reviewed_at,
+    notes: row.notes,
+  };
+}
+
+async function getAuditFeedback(auditId) {
+  const { rows } = await pool.query(
+    'SELECT id, audit_id, label, reviewer, reviewed_at, notes FROM audit_feedback WHERE audit_id = $1 ORDER BY reviewed_at DESC',
+    [auditId]
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    auditId: row.audit_id,
+    label: row.label,
+    reviewer: row.reviewer,
+    reviewedAt: row.reviewed_at instanceof Date ? row.reviewed_at.toISOString() : row.reviewed_at,
+    notes: row.notes,
+  }));
+}
+
+async function getRecentFeedback(limit = 100) {
+  const { rows } = await pool.query(
+    'SELECT id, audit_id, label, reviewer, reviewed_at, notes FROM audit_feedback ORDER BY reviewed_at DESC LIMIT $1',
+    [Math.max(1, Math.min(1000, limit))]
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    auditId: row.audit_id,
+    label: row.label,
+    reviewer: row.reviewer,
+    reviewedAt: row.reviewed_at instanceof Date ? row.reviewed_at.toISOString() : row.reviewed_at,
+    notes: row.notes,
+  }));
+}
+
 function getDb() {
   return pool;
 }
@@ -841,7 +1014,50 @@ async function _prepareStatements() {
   /* legacy no-op: prepared statements are per-query with pg */
 }
 
+async function rollbackMigrationsTo(targetId) {
+  if (!MIGRATIONS.some((m) => m.id === targetId) && targetId !== '0') {
+    throw new Error(`Unknown migration id "${targetId}" (use 0 to drop all app migrations).`);
+  }
+  if (!pool) await init();
+  const canon = new Map(MIGRATIONS.map((m, i) => [m.id, i]));
+  const targetIdx = targetId === '0' ? -1 : canon.get(targetId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'SELECT name FROM schema_migrations ORDER BY applied_at DESC, id DESC'
+    );
+    for (const { name } of rows) {
+      const ix = canon.get(name);
+      if (ix === undefined) continue;
+      if (targetId === '0' || ix > targetIdx) {
+        const m = MIGRATIONS[ix];
+        await m.down(client);
+        await client.query('DELETE FROM schema_migrations WHERE name = $1', [name]);
+      }
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function getMigrationStatus() {
+  if (!pool) await init();
+  const appliedRows = (await pool.query('SELECT name, applied_at FROM schema_migrations ORDER BY applied_at ASC, id ASC'))
+    .rows;
+  const applied = new Set(appliedRows.map((r) => r.name));
+  const pending = MIGRATIONS.filter((m) => !applied.has(m.id)).map((m) => m.id);
+  return { applied: appliedRows, pending };
+}
+
 module.exports = {
+  MIGRATIONS,
+  rollbackMigrationsTo,
+  getMigrationStatus,
   init,
   getDb,
   close,
@@ -855,6 +1071,9 @@ module.exports = {
   isRefreshTokenValid,
   revokeRefreshToken,
   revokeAllUserTokens,
+  getRefreshTokenStatus,
+  markRefreshTokenRotated,
+  markFamilyCompromised,
   storeMFASecret,
   getMFASecret,
   storeMFAChallenge,
@@ -894,5 +1113,8 @@ module.exports = {
   runCleanupJobs,
   seedOAuthClient,
   seedDemoData,
+  recordAuditFeedback,
+  getAuditFeedback,
+  getRecentFeedback,
   _prepareStatements,
 };

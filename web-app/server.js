@@ -1,7 +1,10 @@
+'use strict';
+
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 
 const app = express();
@@ -34,10 +37,111 @@ function outboundPolicyAgentOptions() {
   return { agent: policyHttpsAgent };
 }
 
+function upstreamTimeoutSignal(ms) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(ms);
+  }
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(new Error('POLICY_FETCH_TIMEOUT')), ms);
+  return ac.signal;
+}
+
 async function policyFetch(pathOrUrl, opts = {}) {
-  const url = /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${POLICY_ENGINE_INTERNAL_URL}${pathOrUrl}`;
-  const agentOpts = outboundPolicyAgentOptions();
-  return fetch(url, { ...agentOpts, ...opts });
+  const resolved = /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${POLICY_ENGINE_INTERNAL_URL}${pathOrUrl}`;
+  let urlObj;
+  try {
+    urlObj = new URL(resolved);
+  } catch (e) {
+    throw new Error(`Invalid POLICY_ENGINE URL: ${resolved}`);
+  }
+
+  const useHttps = urlObj.protocol === 'https:';
+  const lib = useHttps ? https : http;
+  const ms = parseInt(process.env.POLICY_FETCH_TIMEOUT_MS || '60000', 10);
+  const agentOpts = useHttps ? outboundPolicyAgentOptions() : {};
+  const signal = opts.signal ?? upstreamTimeoutSignal(ms);
+
+  /** @type {import('http').RequestOptions} */
+  const reqOpts = {
+    hostname: urlObj.hostname,
+    port: urlObj.port || (useHttps ? 443 : 80),
+    path: `${urlObj.pathname}${urlObj.search}`,
+    method: opts.method || 'GET',
+    headers: { ...(opts.headers || {}) },
+    agent: agentOpts.agent,
+  };
+
+  let bodySent = '';
+  if (opts.body !== undefined && opts.body !== null) {
+    bodySent = typeof opts.body === 'string' ? opts.body : String(opts.body);
+    reqOpts.headers['Content-Length'] = Buffer.byteLength(bodySent, 'utf8');
+    if (!reqOpts.headers['Content-Type']) reqOpts.headers['Content-Type'] = 'application/json';
+  }
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    /** @type {import('http').ClientRequest} */
+    let req;
+
+    function settle(err, val) {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (err) reject(err);
+      else resolve(val);
+    }
+
+    function onAbort() {
+      if (req) req.destroy();
+      settle(new Error('POLICY_FETCH_ABORT'));
+    }
+
+    if (signal) {
+      if (signal.aborted) {
+        settle(new Error('POLICY_FETCH_ABORT'));
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    req = lib.request(reqOpts, (incoming) => {
+      const chunks = [];
+      incoming.on('data', (c) => chunks.push(c));
+      incoming.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        settle(null, {
+          ok: incoming.statusCode >= 200 && incoming.statusCode < 300,
+          status: incoming.statusCode,
+          /** @returns {Promise<any>} */
+          async json() {
+            if (!buf.length) return {};
+            return JSON.parse(buf.toString('utf8'));
+          },
+        });
+      });
+    });
+
+    req.on('error', (e) => settle(e));
+
+    req.setTimeout(ms, () => {
+      req.destroy();
+      settle(Object.assign(new Error('POLICY_FETCH_TIMEOUT'), { name: 'TimeoutError' }));
+    });
+
+    if (bodySent) req.write(bodySent, 'utf8');
+    req.end();
+  });
+}
+
+function cookieSecureFlag() {
+  return (
+    process.env.WEB_CSRF_SECURE === 'true'
+    || (process.env.NODE_ENV || '').toLowerCase() === 'production'
+  );
+}
+
+function cookieSameSiteForSessionAndCsrf() {
+  return process.env.WEB_CSRF_SECURE === 'true' ? 'lax' : 'strict';
 }
 
 const OAUTH_CALLBACK_URL = process.env.OAUTH_CALLBACK_URL || `http://localhost:${PORT}/oauth/callback`;
@@ -71,10 +175,9 @@ app.get('/api/csrf-token', (req, res) => {
   const secret = csrfProtect.secretSync();
   res.cookie('_csrf', secret, {
     httpOnly: true,
-    sameSite: 'strict',
+    sameSite: cookieSameSiteForSessionAndCsrf(),
     path: '/',
-    secure: process.env.WEB_CSRF_SECURE === 'true'
-      || (process.env.NODE_ENV || '').toLowerCase() === 'production',
+    secure: cookieSecureFlag(),
   });
   res.json({ csrfToken: csrfProtect.create(secret) });
 });
@@ -105,8 +208,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'strict',
+  secure: cookieSecureFlag(),
+  sameSite: cookieSameSiteForSessionAndCsrf(),
   path: '/',
   maxAge: 15 * 60 * 1000, // 15 minutes
 };
@@ -161,8 +264,19 @@ app.post('/api/login', async (req, res) => {
       return res.json({ ...safeResult, tokenSet: true });
     }
 
-    res.json(result);
+    return res.status(response.status).json(result);
   } catch (err) {
+    const name = err && err.name;
+    if (
+      err && (
+        String(err.message).includes('POLICY_FETCH_TIMEOUT')
+        || name === 'TimeoutError'
+        || err.message === 'POLICY_FETCH_ABORT'
+        || name === 'AbortError'
+      )
+    ) {
+      return res.status(504).json({ decision: 'DENY', reason: 'Policy engine timeout' });
+    }
     console.error('Policy engine error:', err.message);
     res.status(502).json({ decision: 'DENY', reason: 'Policy engine unavailable' });
   }
@@ -343,12 +457,69 @@ app.get('/oauth/login', (req, res) => {
   res.redirect(authUrl);
 });
 
+// ──────────────────── HTML page routes (admin + me) ────────────────────
+// These serve the static SPA-style pages from /public. The pages do their
+// own role check client-side via /js/auth.js — server-side auth happens at
+// the /api/* proxy below, where the bearer token is required.
+
+const ADMIN_PAGES = ['policies', 'audit', 'models', 'users'];
+for (const page of ADMIN_PAGES) {
+  app.get(`/admin/${page}`, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin', `${page}.html`));
+  });
+}
+app.get('/admin', (_req, res) => res.redirect('/admin/policies'));
+
+const ME_PAGES = ['security', 'devices', 'sessions', 'data'];
+for (const page of ME_PAGES) {
+  app.get(`/me/${page}`, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'me', `${page}.html`));
+  });
+}
+app.get('/me', (_req, res) => res.redirect('/me/security'));
+
+// ──────────────────── Generic /api/admin and /api/me proxy ────────────────────
+// Forwards to the policy-engine under /v1/admin/* and /v1/me/*. The bearer
+// token from the browser's session is forwarded as Authorization. CSRF
+// protection above already gates non-GET requests.
+
+async function proxyToPolicyEngine(req, res) {
+  const sub = req.originalUrl.replace(/^\/api/, '');
+  const target = `/v1${sub}`;
+  const auth = req.headers.authorization;
+  const headers = {};
+  if (auth) headers.Authorization = auth;
+  const opts = { method: req.method, headers };
+  if (!['GET', 'HEAD'].includes(req.method) && req.body && Object.keys(req.body).length) {
+    opts.body = JSON.stringify(req.body);
+    headers['Content-Type'] = 'application/json';
+  }
+  try {
+    const upstream = await policyFetch(target, opts);
+    let body = {};
+    try { body = await upstream.json(); } catch { body = {}; }
+    res.status(upstream.status).json(body);
+  } catch (err) {
+    if (err.message === 'POLICY_FETCH_TIMEOUT') {
+      return res.status(504).json({ error: 'Upstream timeout' });
+    }
+    return res.status(502).json({ error: 'Upstream unavailable', detail: err.message });
+  }
+}
+
+app.all('/api/admin/*', proxyToPolicyEngine);
+app.all('/api/me/*',    proxyToPolicyEngine);
+
 // ──────────────────── Health Check ────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', uptime: process.uptime() });
 });
 
-app.listen(PORT, () => {
-  console.log(`Web App running on http://localhost:${PORT}`);
-});
+module.exports = { app, policyFetch, outboundPolicyAgentOptions };
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Web App running on http://localhost:${PORT}`);
+  });
+}

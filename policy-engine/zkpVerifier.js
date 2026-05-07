@@ -444,6 +444,8 @@ function createZKPPackage(riskScore, threshold) {
       property: `0 <= risk_score < ${threshold}`,
       blindingFactorUsed: true,
       rawRiskDisclosedToVerifier: false,
+      nonce: crypto.randomBytes(8).toString('hex'),
+      timestamp: new Date().toISOString(),
     },
   };
 }

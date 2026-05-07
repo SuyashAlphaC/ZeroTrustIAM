@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ML Models · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireRole } from '/js/auth.js';
+  import { renderShell, pageHead, hashCopy, fmtTime, fmtRelative, toast, confirm, escape } from '/js/ui.js';
+  import { get, post } from '/js/api.js';
+
+  requireRole('admin');
+  const main = renderShell({ section: 'admin', currentPath: '/admin/models' });
+  main.innerHTML = pageHead({
+    crumb: 'Governance / Models',
+    title: '<em>Risk</em> model lifecycle',
+    description: 'Champion / challenger comparison, promotion controls, and feature drift surveillance for the Random Forest sidecar.',
+    actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>`,
+  }) + `<div id="content"><div class="empty"><p>Loading model state…</p></div></div>`;
+
+  const $ = (s) => document.querySelector(s);
+  const content = $('#content');
+
+  async function load() {
+    try {
+      const [info, comparison, drift] = await Promise.allSettled([
+        get('/api/admin/ml/info'),
+        get('/api/admin/ml/comparison'),
+        get('/api/admin/ml/drift'),
+      ]);
+      render({
+        info: info.status === 'fulfilled' ? info.value : null,
+        infoErr: info.status === 'rejected' ? info.reason : null,
+        comparison: comparison.status === 'fulfilled' ? comparison.value : null,
+        drift: drift.status === 'fulfilled' ? drift.value : null,
+      });
+    } catch (err) {
+      content.innerHTML = `<div class="empty"><h3>Couldn't load model state</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function render({ info, infoErr, comparison, drift }) {
+    const champ = info?.meta || {};
+    const champMetrics = champ.metrics || {};
+    const accuracy = num(champMetrics.accuracy);
+    const auc = num(champMetrics.roc_auc);
+
+    const compHtml = comparison
+      ? renderComparison(comparison)
+      : `<div class="empty"><p>No challenger candidate available.</p></div>`;
+
+    const driftHtml = drift && drift.features
+      ? renderDrift(drift)
+      : `<div class="empty"><p>Drift data not available.</p></div>`;
+
+    content.innerHTML = `
+      <div class="stat-grid">
+        <div class="stat">
+          <div class="stat-label">Champion model</div>
+          <div class="stat-value">${escape(champ.model_version || '—')}</div>
+          <div class="stat-meta">${champ.trained_at ? 'trained ' + fmtRelative(champ.trained_at) : 'never trained'}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Validation AUC</div>
+          <div class="stat-value">${pct(auc)}</div>
+          <div class="stat-meta">samples: ${escape(champ.n_samples ?? '—')}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Validation accuracy</div>
+          <div class="stat-value">${pct(accuracy)}</div>
+          <div class="stat-meta">${escape(champ.n_features ?? '—')} features</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Sources</div>
+          <div class="stat-value" style="font-size:18px;font-family:var(--font-mono)">${escape((champ.training_sources || ['—']).join(', '))}</div>
+          <div class="stat-meta">live data only · synthetic refused</div>
+        </div>
+      </div>
+
+      <div class="card mb-5">
+        <div class="card-head"><div class="t-h2">Champion / challenger</div></div>
+        <div class="card-body">${compHtml}</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="t-h2">Feature drift (PSI)</div>
+            <div class="t-small mt-1">Population Stability Index per feature, current 24h window vs 7-day baseline.</div>
+          </div>
+        </div>
+        <div class="card-body">${driftHtml}</div>
+        <div class="card-foot">
+          <span>PSI < 0.1 stable · 0.1–0.2 minor · 0.2–0.25 significant · ≥0.25 critical</span>
+        </div>
+      </div>`;
+
+    bind();
+    if (infoErr) toast('Champion info unavailable: ' + (infoErr.message || infoErr), 'error');
+  }
+
+  function renderComparison(c) {
+    const champ = c.champion_metrics || c.championMetrics || {};
+    const cand  = c.candidate_metrics || c.candidateMetrics || {};
+    const dAuc = c.delta_auc ?? c.deltaAuc ?? (num(cand.roc_auc) - num(champ.roc_auc));
+    const dPrec = c.delta_precision_attack ?? c.deltaPrecisionAttack ?? null;
+    const recommend = c.recommend_promote ?? c.recommendPromote;
+
+    return `
+      <table class="table" style="background:transparent">
+        <thead>
+          <tr>
+            <th></th><th class="num">Champion</th><th class="num">Candidate</th><th class="num">Δ</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>ROC-AUC (validation)</td>
+            <td class="num">${pct(num(champ.roc_auc))}</td>
+            <td class="num">${pct(num(cand.roc_auc))}</td>
+            <td class="num"><span class="${dAuc >= 0 ? 'text-allow' : 'text-deny'}">${signedPct(dAuc)}</span></td>
+          </tr>
+          <tr><td>Accuracy</td>
+            <td class="num">${pct(num(champ.accuracy))}</td>
+            <td class="num">${pct(num(cand.accuracy))}</td>
+            <td class="num">${signedPct(num(cand.accuracy) - num(champ.accuracy))}</td>
+          </tr>
+          ${dPrec != null ? `<tr><td>Precision (attack class)</td>
+            <td class="num">—</td><td class="num">—</td>
+            <td class="num"><span class="${dPrec >= 0 ? 'text-allow' : 'text-deny'}">${signedPct(dPrec)}</span></td>
+          </tr>` : ''}
+        </tbody>
+      </table>
+      <div class="flex items-center gap-3 mt-5">
+        <span class="pill ${recommend ? 'allow' : 'muted'} pill-no-dot">${recommend ? 'Recommend promote' : 'Hold champion'}</span>
+        <span class="t-small text-fg-2">Promotion gate: Δ AUC ≥ +0.02 and precision regression ≤ 0.05</span>
+        <div class="flex gap-2" style="margin-left:auto">
+          <button class="btn btn-secondary" id="rollback">Rollback</button>
+          <button class="btn ${recommend ? 'btn-primary' : 'btn-secondary'}" id="promote">Promote candidate</button>
+        </div>
+      </div>`;
+  }
+
+  function renderDrift(d) {
+    const features = d.features || {};
+    const entries = Object.entries(features).sort((a, b) => (b[1] - a[1]));
+    if (!entries.length) return `<div class="empty"><p>No drift values yet.</p></div>`;
+    return `
+      <table class="table" style="background:transparent">
+        <thead>
+          <tr><th>Feature</th><th>PSI</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          ${entries.map(([name, psi]) => {
+            const status = psi >= 0.25 ? 'critical' : psi >= 0.2 ? 'significant' : psi >= 0.1 ? 'minor' : 'stable';
+            const cls = status === 'critical' ? 'deny' : status === 'significant' ? 'stepup' : status === 'minor' ? 'muted' : 'allow';
+            const w = Math.min(100, (psi / 0.5) * 100);
+            const barColor = status === 'critical' ? 'var(--deny)' : status === 'significant' ? 'var(--stepup)' : 'var(--accent)';
+            return `
+              <tr>
+                <td class="t-mono" style="font-size:12px">${escape(name)}</td>
+                <td>
+                  <div class="flex items-center gap-3">
+                    <div style="width:120px;height:4px;background:var(--bg-3);border-radius:2px;overflow:hidden;position:relative">
+                      <div style="position:absolute;inset:0 ${(100 - w).toFixed(1)}% 0 0;background:${barColor};border-radius:2px"></div>
+                    </div>
+                    <span class="t-mono">${psi.toFixed(3)}</span>
+                  </div>
+                </td>
+                <td><span class="pill ${cls} pill-no-dot">${status}</span></td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  function bind() {
+    const promote = document.getElementById('promote');
+    const rollback = document.getElementById('rollback');
+    if (promote) promote.addEventListener('click', async () => {
+      const ok = await confirm({
+        title: 'Promote candidate model?',
+        body: 'The candidate becomes the new champion and the previous version is archived for rollback. The model will be hot-swapped without dropping requests.',
+        confirmLabel: 'Promote',
+      });
+      if (!ok) return;
+      try {
+        await post('/api/admin/ml/promote', {});
+        toast('Candidate promoted', 'success');
+        load();
+      } catch (err) { toast(err.message, 'error'); }
+    });
+    if (rollback) rollback.addEventListener('click', async () => {
+      const ok = await confirm({
+        title: 'Roll back to previous champion?',
+        body: 'The current champion will be archived and the previously-archived version becomes active.',
+        danger: true, confirmLabel: 'Roll back',
+      });
+      if (!ok) return;
+      try {
+        await post('/api/admin/ml/rollback', {});
+        toast('Rolled back', 'success');
+        load();
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  }
+
+  function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+  function pct(v) { return (num(v) * 100).toFixed(1) + '%'; }
+  function signedPct(v) { const n = num(v); return (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%'; }
+
+  document.getElementById('refresh').addEventListener('click', load);
+  load();
+</script>
+</body>
+</html>

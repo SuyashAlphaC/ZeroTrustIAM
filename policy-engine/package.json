@@ -4,14 +4,17 @@
   "description": "Zero Trust IAM - Policy Engine",
   "main": "server.js",
   "scripts": {
+    "migrate": "node scripts/migrate.js",
     "start": "node server.js",
     "test": "jest --runInBand --forceExit --detectOpenHandles",
     "test:unit": "jest --testPathPatterns='__tests__/unit' --forceExit",
     "test:integration": "jest --testPathPatterns='__tests__/integration' --forceExit --detectOpenHandles"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.658.0",
     "@grpc/grpc-js": "^1.14.3",
     "@hyperledger/fabric-gateway": "^1.10.1",
+    "ioredis": "^5.4.1",
     "@opentelemetry/auto-instrumentations-node": "^0.47.1",
     "@opentelemetry/exporter-trace-otlp-http": "^0.52.1",
     "@opentelemetry/resources": "^1.30.1",

@@ -1,4 +1,11 @@
 node_modules/
+coverage/
+chaincode/coverage/
+web-app/coverage/
+policy-engine/coverage/
+ml-service/.pytest_cache/
+ml-service/.coverage
+ml-service/htmlcov/
 policy-engine/data/
 policy-engine/.env
 *.db

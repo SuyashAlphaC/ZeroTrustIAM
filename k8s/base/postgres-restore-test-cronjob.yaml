@@ -1,0 +1,127 @@
+# Weekly restore-from-backup verification.
+#
+# Steps run by the job:
+#   1. Materialise a fresh sandbox cnpg cluster from the most recent backup
+#      using `kubectl cnpg restore`.
+#   2. Wait for the sandbox primary to come up.
+#   3. Connect via psql and assert each critical table has > 0 rows.
+#   4. Tear the sandbox cluster down.
+#   5. Exit non-zero on any failure — Kubernetes surfaces a Failed Job which
+#      Prometheus AlertManager (via kube-state-metrics rule
+#      `kube_job_status_failed{job="postgres-restore-weekly"}`) will alert on.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: postgres-restore-tester
+  namespace: ztiam
+rules:
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters", "backups", "scheduledbackups"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "secrets", "services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-restore-tester
+  namespace: ztiam
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-restore-tester
+  namespace: ztiam
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: postgres-restore-tester
+subjects:
+  - kind: ServiceAccount
+    name: postgres-restore-tester
+    namespace: ztiam
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-restore-weekly
+  namespace: ztiam
+spec:
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: postgres-restore-tester
+          restartPolicy: OnFailure
+          containers:
+            - name: restore-test
+              image: ghcr.io/cloudnative-pg/cnpg-tools:1.22.0
+              env:
+                - name: SANDBOX
+                  value: ztiam-pg-restore-test
+                - name: SOURCE_CLUSTER
+                  value: ztiam-pg
+                - name: NAMESPACE
+                  value: ztiam
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+                  echo "[restore-test] starting"
+                  # Find the latest completed Backup for the cluster.
+                  LATEST="$(kubectl -n "$NAMESPACE" get backup \
+                    -l cnpg.io/cluster="$SOURCE_CLUSTER" \
+                    --sort-by=.status.stoppedAt \
+                    -o jsonpath='{.items[?(@.status.phase=="completed")].metadata.name}' \
+                    | tr ' ' '\n' | tail -n1)"
+                  if [ -z "$LATEST" ]; then
+                    echo "[restore-test] no completed backup found"; exit 1
+                  fi
+                  echo "[restore-test] using backup $LATEST"
+                  kubectl -n "$NAMESPACE" delete cluster "$SANDBOX" --ignore-not-found
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: postgresql.cnpg.io/v1
+                  kind: Cluster
+                  metadata:
+                    name: $SANDBOX
+                    namespace: $NAMESPACE
+                  spec:
+                    instances: 1
+                    storage:
+                      size: 20Gi
+                    bootstrap:
+                      recovery:
+                        backup:
+                          name: $LATEST
+                  EOF
+                  # Wait up to 15min for the sandbox primary to be ready.
+                  kubectl -n "$NAMESPACE" wait cluster/"$SANDBOX" \
+                    --for=condition=Ready --timeout=900s
+                  # Smoke-check critical tables.
+                  PASS=1
+                  for TABLE in users audit_feedback access_grants risk_scores; do
+                    COUNT="$(kubectl -n "$NAMESPACE" exec "$SANDBOX-1" -c postgres -- \
+                      psql -tAc "SELECT COUNT(*) FROM \"$TABLE\";" ztiam || echo "ERR")"
+                    echo "[restore-test] $TABLE rows=$COUNT"
+                    case "$COUNT" in
+                      ''|*[!0-9]*) echo "[restore-test] $TABLE: query failed"; PASS=0 ;;
+                      *) [ "$COUNT" -gt 0 ] || { echo "[restore-test] $TABLE empty"; PASS=0; } ;;
+                    esac
+                  done
+                  kubectl -n "$NAMESPACE" delete cluster "$SANDBOX" --ignore-not-found
+                  [ "$PASS" -eq 1 ] || exit 1
+                  echo "[restore-test] OK"
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

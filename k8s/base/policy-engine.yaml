@@ -59,11 +59,20 @@ spec:
             - configMapRef:
                 name: ztiam-policy-config
           env:
-            - name: DATABASE_URL
+            # Database connections target the cnpg PgBouncer service (pgbouncer.yaml).
+            # PgBouncer is configured for transaction pool_mode — the app must NOT rely
+            # on session-level state (LISTEN/NOTIFY, prepared statements across requests,
+            # SET LOCAL outside a transaction). Node `pg` is fine by default: it does not
+            # use server-side prepared statements unless you opt in via Client/PreparedStatement.
+            - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: ztiam-secrets
-                  key: DATABASE_URL
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgresql://ztiam:$(POSTGRES_PASSWORD)@ztiam-pg-rw:5432/ztiam"
+            - name: DATABASE_READ_URL
+              value: "postgresql://ztiam:$(POSTGRES_PASSWORD)@ztiam-pg-ro:5432/ztiam"
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Users · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireRole } from '/js/auth.js';
+  import { renderShell, pageHead, sparkline, fmtRelative, toast, confirm, escape } from '/js/ui.js';
+  import { get, post } from '/js/api.js';
+
+  requireRole('admin');
+  const main = renderShell({ section: 'admin', currentPath: '/admin/users' });
+  main.innerHTML = pageHead({
+    crumb: 'Governance / Users',
+    title: '<em>User</em> directory',
+    description: 'Every account, last activity, and risk trajectory. Operator actions audit on the same chain as access decisions.',
+    actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>`,
+  }) + `
+    <div class="filters">
+      <div class="field" style="flex:2">
+        <label class="field-label" for="q">Search</label>
+        <input class="input" id="q" placeholder="username, email, role…">
+      </div>
+      <div class="field">
+        <label class="field-label" for="role">Role</label>
+        <select class="select" id="role">
+          <option value="">All</option>
+          <option value="admin">admin</option>
+          <option value="user">user</option>
+          <option value="auditor">auditor</option>
+        </select>
+      </div>
+    </div>
+    <div id="content"></div>`;
+
+  const $ = (s) => document.querySelector(s);
+  let allUsers = [];
+
+  async function load() {
+    $('#content').innerHTML = `<div class="empty"><p>Loading users…</p></div>`;
+    try {
+      const data = await get('/api/admin/users');
+      allUsers = Array.isArray(data) ? data : (data.users || []);
+      render();
+    } catch (err) {
+      $('#content').innerHTML = `<div class="empty"><h3>Couldn't load users</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function filtered() {
+    const q = $('#q').value.trim().toLowerCase();
+    const role = $('#role').value;
+    return allUsers.filter((u) => {
+      if (role && u.role !== role) return false;
+      if (q) {
+        const blob = (u.username + ' ' + (u.email || '') + ' ' + (u.role || '')).toLowerCase();
+        if (!blob.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
+  function render() {
+    const rows = filtered();
+    if (!rows.length) {
+      $('#content').innerHTML = `<div class="empty"><h3>No users match</h3></div>`;
+      return;
+    }
+    $('#content').innerHTML = `
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Role</th>
+              <th>Last login</th>
+              <th>Risk trend</th>
+              <th>Sessions</th>
+              <th>Devices</th>
+              <th>MFA</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(rowHtml).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="t-small text-fg-2 mt-3">${rows.length} of ${allUsers.length} users</div>`;
+    bind();
+  }
+
+  function rowHtml(u) {
+    const initials = (u.username || '?').slice(0, 2).toUpperCase();
+    const last = u.lastLoginAt || u.last_login_at;
+    const trend = Array.isArray(u.recentRiskScores) ? u.recentRiskScores
+                  : Array.isArray(u.recent_risk_scores) ? u.recent_risk_scores
+                  : [];
+    const sessions = u.activeSessions ?? u.active_sessions ?? 0;
+    const devices = u.deviceCount ?? u.device_count ?? (Array.isArray(u.devices) ? u.devices.length : '—');
+    const mfa = u.mfaEnabled ?? u.mfa_enabled;
+    return `
+      <tr data-username="${escape(u.username)}">
+        <td>
+          <div class="flex items-center gap-3">
+            <span class="user-avatar">${escape(initials)}</span>
+            <div>
+              <div>${escape(u.username)}</div>
+              <div class="t-small text-fg-2">${escape(u.email || u.sub || '—')}</div>
+            </div>
+          </div>
+        </td>
+        <td><span class="pill muted pill-no-dot">${escape(u.role || 'user')}</span></td>
+        <td>
+          <div>${escape(fmtRelative(last))}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${u.lastLoginCountry || u.last_login_country ? escape(u.lastLoginCountry || u.last_login_country) : ''}</div>
+        </td>
+        <td>${trend.length ? sparkline(trend, { threshold: 0.6 }) : '<span class="t-mono text-fg-2">—</span>'}</td>
+        <td class="num t-mono">${escape(sessions)}</td>
+        <td class="num t-mono">${escape(devices)}</td>
+        <td>${mfa ? '<span class="pill allow pill-no-dot">on</span>' : '<span class="pill muted pill-no-dot">off</span>'}</td>
+        <td>
+          <div class="flex gap-1 justify-end">
+            <button class="btn btn-ghost btn-sm" data-act="step-up">Force MFA</button>
+            <button class="btn btn-ghost btn-sm" data-act="revoke">Revoke sessions</button>
+            <button class="btn btn-ghost btn-sm" data-act="reset">Reset password</button>
+          </div>
+        </td>
+      </tr>`;
+  }
+
+  function bind() {
+    document.querySelectorAll('tbody tr').forEach((tr) => {
+      const username = tr.dataset.username;
+      tr.querySelectorAll('button[data-act]').forEach((btn) => {
+        btn.addEventListener('click', async () => action(btn.dataset.act, username));
+      });
+    });
+  }
+
+  async function action(act, username) {
+    const labels = {
+      'step-up': { title: 'Force MFA on next login?', body: `${escape(username)} will be required to complete MFA on their next access decision regardless of risk.`, label: 'Force MFA' },
+      'revoke':  { title: 'Revoke all sessions?', body: `All active refresh tokens and access grants for <b>${escape(username)}</b> will be invalidated. Active session bearer tokens expire after their natural TTL.`, label: 'Revoke', danger: true },
+      'reset':   { title: 'Issue password reset?', body: `A reset link will be generated for <b>${escape(username)}</b>. The link is valid for 30 minutes.`, label: 'Issue reset' },
+    };
+    const c = labels[act];
+    const ok = await confirm({ title: c.title, body: c.body, danger: c.danger, confirmLabel: c.label });
+    if (!ok) return;
+    try {
+      await post(`/api/admin/users/${encodeURIComponent(username)}/${act}`, {});
+      toast(`${c.label} succeeded for ${username}`, 'success');
+      load();
+    } catch (err) { toast(err.message, 'error'); }
+  }
+
+  document.getElementById('refresh').addEventListener('click', load);
+  $('#q').addEventListener('input', render);
+  $('#role').addEventListener('change', render);
+  load();
+</script>
+</body>
+</html>

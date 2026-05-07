@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Security · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireAuth, getSession } from '/js/auth.js';
+  import { renderShell, pageHead, decisionPill, fmtTime, fmtRelative, toast, escape } from '/js/ui.js';
+  import { get, post } from '/js/api.js';
+
+  const session = requireAuth();
+  const main = renderShell({ section: 'me', currentPath: '/me/security' });
+
+  if (new URLSearchParams(location.search).get('denied') === 'role') {
+    setTimeout(() => toast('Admin role required for that page', 'error'), 50);
+  }
+
+  main.innerHTML = pageHead({
+    crumb: 'Account / Security',
+    title: '<em>Security</em> & sign-in',
+    description: 'Password, multi-factor enrolment, and recent access decisions for your account.',
+  }) + `
+    <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5)">
+
+      <div class="card">
+        <div class="card-head"><div class="t-h2">Change password</div></div>
+        <div class="card-body">
+          <form id="pw-form">
+            <div class="field">
+              <label class="field-label" for="cur">Current password</label>
+              <input class="input" id="cur" type="password" autocomplete="current-password" required>
+            </div>
+            <div class="field">
+              <label class="field-label" for="new">New password</label>
+              <input class="input" id="new" type="password" autocomplete="new-password" required minlength="12">
+              <div class="field-hint">Minimum 12 characters · mix of letters, numbers, symbols.</div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="conf">Confirm new password</label>
+              <input class="input" id="conf" type="password" autocomplete="new-password" required>
+            </div>
+            <div id="pw-err" class="field-error hidden"></div>
+            <div class="flex justify-end mt-4">
+              <button class="btn btn-primary" type="submit">Change password</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="t-h2">Multi-factor authentication</div>
+            <div class="t-small mt-1">Step-up triggers when ensemble risk meets the policy threshold.</div>
+          </div>
+        </div>
+        <div class="card-body" id="mfa-body">
+          <div class="empty"><p>Loading MFA state…</p></div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="card mt-5">
+      <div class="card-head">
+        <div class="t-h2">Recent access decisions</div>
+        <div class="t-small">Last 25 attempts on your account</div>
+      </div>
+      <div class="card-body" style="padding:0">
+        <div id="logins"><div class="empty"><p>Loading…</p></div></div>
+      </div>
+    </div>`;
+
+  const $ = (s) => document.querySelector(s);
+
+  // ─── Password change ────────────────────────────────────────────────
+  $('#pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const cur = $('#cur').value, n = $('#new').value, conf = $('#conf').value;
+    const err = $('#pw-err'); err.classList.add('hidden');
+    if (n !== conf) { err.textContent = 'New passwords do not match'; err.classList.remove('hidden'); return; }
+    if (n.length < 12) { err.textContent = 'New password must be at least 12 characters'; err.classList.remove('hidden'); return; }
+    try {
+      await post('/api/me/change-password', { currentPassword: cur, newPassword: n });
+      toast('Password changed. All other sessions will be revoked on their next request.', 'success', 5000);
+      $('#pw-form').reset();
+    } catch (e) {
+      err.textContent = e.message; err.classList.remove('hidden');
+    }
+  });
+
+  // ─── MFA ────────────────────────────────────────────────────────────
+  async function loadMfa() {
+    try {
+      const status = await get(`/api/mfa/status/${encodeURIComponent(session.username || session.user?.username || '')}`);
+      const wa = await get(`/api/webauthn/status/${encodeURIComponent(session.username || session.user?.username || '')}`).catch(() => null);
+      renderMfa(status, wa);
+    } catch (e) {
+      $('#mfa-body').innerHTML = `<div class="empty"><p>${escape(e.message)}</p></div>`;
+    }
+  }
+
+  function renderMfa(status, wa) {
+    const totp = !!(status && (status.enrolled || status.enabled));
+    const passkeyCount = wa?.credentialCount ?? wa?.count ?? 0;
+    $('#mfa-body').innerHTML = `
+      <dl>
+        <div class="detail-row">
+          <dt>Authenticator app (TOTP)</dt>
+          <dd class="flex items-center justify-between">
+            <span>${totp
+              ? '<span class="pill allow pill-no-dot">enrolled</span>'
+              : '<span class="pill muted pill-no-dot">not enrolled</span>'}</span>
+            ${totp
+              ? '<button class="btn btn-ghost btn-sm" id="totp-disable">Remove</button>'
+              : '<button class="btn btn-secondary btn-sm" id="totp-enroll">Enrol TOTP</button>'}
+          </dd>
+        </div>
+        <div class="detail-row">
+          <dt>Passkey / WebAuthn</dt>
+          <dd class="flex items-center justify-between">
+            <span>${passkeyCount > 0
+              ? `<span class="pill allow pill-no-dot">${passkeyCount} key${passkeyCount === 1 ? '' : 's'}</span>`
+              : '<span class="pill muted pill-no-dot">no keys</span>'}</span>
+            <button class="btn btn-secondary btn-sm" id="passkey-add">Add passkey</button>
+          </dd>
+        </div>
+      </dl>
+      <div id="mfa-detail" class="mt-4"></div>`;
+    bindMfa();
+  }
+
+  function bindMfa() {
+    const enroll = document.getElementById('totp-enroll');
+    if (enroll) enroll.addEventListener('click', async () => {
+      try {
+        const r = await post('/api/mfa/enroll', { username: session.username });
+        const detail = document.getElementById('mfa-detail');
+        const otpauth = r.otpauth_url || r.otpauthUrl;
+        const qr = r.qrcode || r.qr_data_url;
+        detail.innerHTML = `
+          <div class="card" style="background:var(--bg-2)">
+            <div class="card-body">
+              <div class="t-h3 mb-2">Scan with your authenticator</div>
+              ${qr ? `<img src="${escape(qr)}" alt="MFA QR" style="width:180px;height:180px;background:#fff;padding:8px;border-radius:var(--radius)">` : ''}
+              ${otpauth ? `<div class="t-mono text-fg-2 mt-3" style="word-break:break-all;font-size:11px">${escape(otpauth)}</div>` : ''}
+              <div class="field mt-4">
+                <label class="field-label" for="totp-verify">Enter 6-digit code to confirm</label>
+                <input class="input mono" id="totp-verify" maxlength="6" pattern="[0-9]{6}" inputmode="numeric" placeholder="000000">
+              </div>
+              <div class="flex justify-end">
+                <button class="btn btn-primary" id="totp-confirm">Confirm enrolment</button>
+              </div>
+            </div>
+          </div>`;
+        document.getElementById('totp-confirm').addEventListener('click', async () => {
+          const code = document.getElementById('totp-verify').value;
+          try {
+            await post('/api/mfa/challenge', { username: session.username, code });
+            toast('TOTP enrolled', 'success');
+            loadMfa();
+          } catch (e) { toast(e.message, 'error'); }
+        });
+      } catch (e) { toast(e.message, 'error'); }
+    });
+
+    const passkey = document.getElementById('passkey-add');
+    if (passkey) passkey.addEventListener('click', async () => {
+      if (!window.PublicKeyCredential) { toast('This browser does not support WebAuthn', 'error'); return; }
+      try {
+        const opts = await post('/api/webauthn/register/options', { username: session.username });
+        opts.challenge = base64urlToBuffer(opts.challenge);
+        opts.user.id = base64urlToBuffer(opts.user.id);
+        if (opts.excludeCredentials) opts.excludeCredentials.forEach((c) => c.id = base64urlToBuffer(c.id));
+        const cred = await navigator.credentials.create({ publicKey: opts });
+        const att = {
+          id: cred.id, rawId: bufferToBase64url(cred.rawId), type: cred.type,
+          response: {
+            attestationObject: bufferToBase64url(cred.response.attestationObject),
+            clientDataJSON: bufferToBase64url(cred.response.clientDataJSON),
+          },
+        };
+        await post('/api/webauthn/register/verify', { username: session.username, response: att });
+        toast('Passkey added', 'success');
+        loadMfa();
+      } catch (e) { toast(e.message || 'Passkey registration failed', 'error'); }
+    });
+  }
+
+  function base64urlToBuffer(s) {
+    const b64 = s.replace(/-/g, '+').replace(/_/g, '/').padEnd(s.length + (4 - s.length % 4) % 4, '=');
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr.buffer;
+  }
+  function bufferToBase64url(buf) {
+    const bin = String.fromCharCode(...new Uint8Array(buf));
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // ─── Recent logins ──────────────────────────────────────────────────
+  async function loadLogins() {
+    try {
+      const data = await get('/api/me/login-history?limit=25');
+      const list = Array.isArray(data) ? data : (data.entries || data.history || []);
+      if (!list.length) {
+        $('#logins').innerHTML = `<div class="empty"><p>No history yet.</p></div>`;
+        return;
+      }
+      $('#logins').innerHTML = `
+        <table class="table">
+          <thead><tr><th>When</th><th>Decision</th><th>From</th><th>Device</th><th>Reason</th></tr></thead>
+          <tbody>
+            ${list.map((l) => `
+              <tr>
+                <td>
+                  <div>${escape(fmtRelative(l.timestamp || l.ts))}</div>
+                  <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(l.timestamp || l.ts))}</div>
+                </td>
+                <td>${decisionPill(l.decision)}</td>
+                <td>
+                  <div>${escape(l.country || (l.location && l.location.country) || '—')}</div>
+                  <div class="t-mono text-fg-2" style="font-size:11px">${escape(l.ip || '')}</div>
+                </td>
+                <td><span class="t-mono">${escape((l.deviceId || l.device_id || '').slice(0, 14)) || '—'}</span></td>
+                <td><span class="t-small">${escape(l.reason || '—')}</span></td>
+              </tr>`).join('')}
+          </tbody>
+        </table>`;
+    } catch (e) {
+      $('#logins').innerHTML = `<div class="empty"><p>${escape(e.message)}</p></div>`;
+    }
+  }
+
+  loadMfa(); loadLogins();
+</script>
+</body>
+</html>

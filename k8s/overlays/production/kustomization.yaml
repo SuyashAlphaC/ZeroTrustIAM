@@ -1,0 +1,11 @@
+# Production overlay — delete plaintext Secret from base; add Vault ExternalSecret or sealed manifest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ztiam
+resources:
+  - ../../
+  - ../../base/external-secret-vault.yaml
+  - network-egress-restrictions.yaml
+patchesStrategicMerge:
+  - delete-placeholder.yaml
+# Or: replace ExternalSecret resource with ../../base/secrets-sealed.yaml from `scripts/seal-secrets.sh`

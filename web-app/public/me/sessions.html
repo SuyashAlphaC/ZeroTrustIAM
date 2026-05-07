@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sessions · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireAuth } from '/js/auth.js';
+  import { renderShell, pageHead, hashCopy, fmtRelative, fmtTime, toast, confirm, escape } from '/js/ui.js';
+  import { get, del, post } from '/js/api.js';
+
+  requireAuth();
+  const main = renderShell({ section: 'me', currentPath: '/me/sessions' });
+  main.innerHTML = pageHead({
+    crumb: 'Account / Sessions',
+    title: '<em>Active</em> sessions',
+    description: 'Live refresh-token families bound to your account. Revoke anything that looks unfamiliar.',
+    actions: `<button class="btn btn-danger" id="revoke-all">Revoke all but current</button>`,
+  }) + `<div id="content"></div>`;
+
+  const $ = (s) => document.querySelector(s);
+
+  async function load() {
+    $('#content').innerHTML = `<div class="empty"><p>Loading sessions…</p></div>`;
+    try {
+      const data = await get('/api/me/sessions');
+      const list = Array.isArray(data) ? data : (data.sessions || []);
+      render(list);
+    } catch (err) {
+      $('#content').innerHTML = `<div class="empty"><h3>Couldn't load sessions</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function render(sessions) {
+    if (!sessions.length) {
+      $('#content').innerHTML = `<div class="empty"><h3>No active sessions</h3></div>`;
+      return;
+    }
+    $('#content').innerHTML = `
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>Session</th><th>Started</th><th>Last refreshed</th><th>Family</th><th>From</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${sessions.map(rowHtml).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="t-small text-fg-2 mt-3">${sessions.length} session${sessions.length === 1 ? '' : 's'} · refresh-token families track rotation lineage</div>`;
+    bind();
+  }
+
+  function rowHtml(s) {
+    return `
+      <tr data-id="${escape(s.id || s.tokenHash || '')}" data-current="${s.current ? '1' : ''}">
+        <td>
+          <div class="flex items-center gap-3">
+            ${s.current ? '<span class="pill allow">current</span>' : ''}
+            <div>
+              <div>${escape(s.label || s.userAgent || 'Browser session')}</div>
+              <div class="t-small text-fg-2">${escape(s.os || '')}${s.browser ? ' · ' + escape(s.browser) : ''}</div>
+            </div>
+          </div>
+        </td>
+        <td>
+          <div>${escape(fmtRelative(s.createdAt || s.created_at))}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(s.createdAt || s.created_at))}</div>
+        </td>
+        <td>
+          <div>${escape(fmtRelative(s.refreshedAt || s.refreshed_at || s.lastUsedAt))}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(s.refreshedAt || s.refreshed_at))}</div>
+        </td>
+        <td>${hashCopy(s.familyId || s.family_id, { length: 10 })}</td>
+        <td>
+          <div>${escape((s.location && (s.location.city + ', ' + s.location.country)) || s.country || '—')}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(s.ip || '')}</div>
+        </td>
+        <td>
+          <button class="btn btn-ghost btn-sm" data-act="revoke" ${s.current ? 'disabled' : ''}>Revoke</button>
+        </td>
+      </tr>`;
+  }
+
+  function bind() {
+    document.querySelectorAll('button[data-act=revoke]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const tr = btn.closest('tr');
+        const id = tr.dataset.id;
+        const ok = await confirm({
+          title: 'Revoke this session?',
+          body: 'The next refresh attempt from this session will fail and the user will be redirected to login.',
+          danger: true, confirmLabel: 'Revoke',
+        });
+        if (!ok) return;
+        try {
+          await del(`/api/me/sessions/${encodeURIComponent(id)}`);
+          toast('Session revoked', 'success');
+          load();
+        } catch (e) { toast(e.message, 'error'); }
+      });
+    });
+  }
+
+  document.getElementById('revoke-all').addEventListener('click', async () => {
+    const ok = await confirm({
+      title: 'Revoke every other session?',
+      body: 'Every device except this one will be signed out. You stay signed in here.',
+      danger: true, confirmLabel: 'Revoke all',
+    });
+    if (!ok) return;
+    try {
+      await post('/api/me/sessions/revoke-others', {});
+      toast('Other sessions revoked', 'success');
+      load();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+
+  load();
+</script>
+</body>
+</html>

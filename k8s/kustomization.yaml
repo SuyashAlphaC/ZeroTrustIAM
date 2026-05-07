@@ -1,5 +1,8 @@
 # Apply: kubectl apply -k k8s/
-# Override images and secrets before production use.
+# Production: use kubectl apply -k k8s/overlays/production/ (removes plaintext Secret; uses ExternalSecret or SealedSecret).
+#
+# Prerequisite: install the CloudNativePG operator before applying this bundle:
+#   kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.0.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ztiam
@@ -7,9 +10,19 @@ resources:
   - base/namespace.yaml
   - base/secrets-placeholder.yaml
   - base/configmap-policy-engine.yaml
-  - base/postgres.yaml
+  - base/cnpg-cluster.yaml
+  - base/cnpg-backup.yaml
+  - base/pgbouncer.yaml
+  - base/pgbouncer-readonly.yaml
+  - base/postgres-backup-cronjob.yaml
+  - base/postgres-restore-test-cronjob.yaml
+  - base/networkpolicies.yaml
   - base/ml-service.yaml
+  - base/redis.yaml
   - base/policy-engine.yaml
   - base/web-app.yaml
   - base/hpa.yaml
   - base/ingress.yaml
+# Optional secret paths (not applied by default):
+#   - base/secrets-sealed.example.yaml  → copy to overlay and kubeseal real values
+#   - base/external-secret-vault.yaml   → referenced from overlays/production

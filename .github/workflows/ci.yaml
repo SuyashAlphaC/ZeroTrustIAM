@@ -86,17 +86,44 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: chaincode/package-lock.json
       - name: Install
-        run: npm install --no-audit --no-fund
+        run: npm ci
       - name: ESLint
         run: npx --yes eslint .
+      - name: Test
+        run: npm test
+      - name: Coverage gate
+        run: npm run test:coverage
       - name: JavaScript syntax check
         run: node --check index.js && node --check lib/iamContract.js
+
+  web-app:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web-app/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: ESLint
+        run: npx --yes eslint .
+      - name: npm audit (production, critical-only)
+        run: npm audit --omit=dev --audit-level=critical
+      - name: Test
+        run: npm test
 
   docker-push:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [policy-engine, ml-service, chaincode]
+    needs: [policy-engine, ml-service, chaincode, web-app]
     permissions:
       contents: read
       packages: write
@@ -168,7 +195,7 @@ jobs:
   docker-build-pr:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    needs: [policy-engine, ml-service, chaincode]
+    needs: [policy-engine, ml-service, chaincode, web-app]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx

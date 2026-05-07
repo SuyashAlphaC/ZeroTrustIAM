@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>My Devices · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireAuth } from '/js/auth.js';
+  import { renderShell, pageHead, hashCopy, fmtRelative, fmtTime, toast, confirm, escape } from '/js/ui.js';
+  import { get, del } from '/js/api.js';
+
+  requireAuth();
+  const main = renderShell({ section: 'me', currentPath: '/me/devices' });
+  main.innerHTML = pageHead({
+    crumb: 'Account / Devices',
+    title: '<em>Trusted</em> devices',
+    description: 'Browsers and devices that have signed in to your account. Revoke any you do not recognise.',
+  }) + `<div id="content"></div>`;
+
+  const $ = (s) => document.querySelector(s);
+
+  async function load() {
+    $('#content').innerHTML = `<div class="empty"><p>Loading devices…</p></div>`;
+    try {
+      const data = await get('/api/me/devices');
+      const list = Array.isArray(data) ? data : (data.devices || []);
+      render(list);
+    } catch (err) {
+      $('#content').innerHTML = `<div class="empty"><h3>Couldn't load devices</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function render(devices) {
+    if (!devices.length) {
+      $('#content').innerHTML = `<div class="empty"><h3>No registered devices</h3><p>Sign in from a browser to register one.</p></div>`;
+      return;
+    }
+    const current = devices.find((d) => d.current) || null;
+    $('#content').innerHTML = `
+      <div class="stat-grid">
+        <div class="stat">
+          <div class="stat-label">Registered</div>
+          <div class="stat-value">${devices.length}</div>
+          <div class="stat-meta">${devices.filter((d) => d.trusted).length} trusted · ${devices.filter((d) => !d.trusted).length} unverified</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Current</div>
+          <div class="stat-value" style="font-size:18px;font-family:var(--font-ui)">${escape(current?.label || current?.userAgent || 'this browser')}</div>
+          <div class="stat-meta">${current ? fmtRelative(current.lastSeenAt || current.last_seen_at) : '—'}</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="t-h2">All devices</div></div>
+        <div class="card-body" style="padding:0">
+          <table class="table">
+            <thead>
+              <tr><th>Device</th><th>Last seen</th><th>From</th><th>Device ID</th><th></th></tr>
+            </thead>
+            <tbody>
+              ${devices.map((d) => deviceRow(d)).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+    bind();
+  }
+
+  function deviceRow(d) {
+    const id = d.deviceId || d.device_id || d.id;
+    const last = d.lastSeenAt || d.last_seen_at || d.lastSeen;
+    return `
+      <tr data-id="${escape(id)}" data-current="${d.current ? '1' : ''}">
+        <td>
+          <div class="flex items-center gap-3">
+            ${d.current ? '<span class="pill allow">current</span>' : ''}
+            <div>
+              <div>${escape(d.label || d.name || d.userAgent || 'Unknown device')}</div>
+              <div class="t-small text-fg-2">${escape((d.os || '') + (d.browser ? ' · ' + d.browser : ''))}</div>
+            </div>
+          </div>
+        </td>
+        <td>
+          <div>${escape(fmtRelative(last))}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(last))}</div>
+        </td>
+        <td>
+          <div>${escape((d.location && (d.location.city + ', ' + d.location.country)) || d.country || '—')}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(d.lastIp || d.last_ip || '')}</div>
+        </td>
+        <td>${hashCopy(id, { length: 14 })}</td>
+        <td>
+          <button class="btn btn-ghost btn-sm" data-act="revoke" ${d.current ? 'disabled title="Revoking the current device would log you out"' : ''}>Revoke</button>
+        </td>
+      </tr>`;
+  }
+
+  function bind() {
+    document.querySelectorAll('button[data-act=revoke]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const tr = btn.closest('tr');
+        const id = tr.dataset.id;
+        const ok = await confirm({
+          title: 'Revoke this device?',
+          body: 'Future sign-ins from this device will be flagged as unknown and will incur a higher risk score (likely STEP_UP or DENY).',
+          danger: true, confirmLabel: 'Revoke',
+        });
+        if (!ok) return;
+        try {
+          await del(`/api/me/devices/${encodeURIComponent(id)}`);
+          toast('Device revoked', 'success');
+          load();
+        } catch (err) { toast(err.message, 'error'); }
+      });
+    });
+  }
+
+  load();
+</script>
+</body>
+</html>

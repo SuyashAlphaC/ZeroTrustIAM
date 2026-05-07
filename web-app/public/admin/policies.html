@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Policies · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireRole } from '/js/auth.js';
+  import { renderShell, pageHead, hashCopy, fmtTime, toast, escape } from '/js/ui.js';
+  import { get, post } from '/js/api.js';
+
+  requireRole('admin');
+  const main = renderShell({ section: 'admin', currentPath: '/admin/policies' });
+  main.innerHTML = pageHead({
+    crumb: 'Governance / Policies',
+    title: '<em>Policy</em> public parameters',
+    description: 'On-chain governance values that gate every access decision. Changes are written to Hyperledger Fabric and require an audit trail.',
+  }) + `<div id="content"><div class="empty"><p>Loading current parameters…</p></div></div>`;
+
+  const $ = (s) => document.querySelector(s);
+  const content = $('#content');
+
+  async function load() {
+    try {
+      const data = await get('/api/admin/policies');
+      render(data);
+    } catch (err) {
+      content.innerHTML = `<div class="empty"><h3>Couldn't load policies</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function render(p) {
+    const updatedAt = p.updatedAt || p.lastUpdate || null;
+    const txId = p.updateTxId || p.txId || null;
+    content.innerHTML = `
+      <div class="card mb-5">
+        <div class="card-head">
+          <div>
+            <div class="t-h2">Active policy</div>
+            <div class="t-small mt-1">Policy ID <span class="t-mono">${escape(p.policyId || '—')}</span> · Version <span class="t-mono">${escape(p.policyVersion || '—')}</span></div>
+          </div>
+          <div class="flex gap-3 items-center">
+            ${updatedAt ? `<div class="t-small text-fg-2">Updated ${escape(fmtTime(updatedAt))}</div>` : ''}
+            ${txId ? hashCopy(txId, { length: 14 }) : ''}
+          </div>
+        </div>
+        <div class="card-body">
+          <form id="form" class="grid">
+            <div class="field">
+              <label class="field-label" for="riskThreshold">Risk threshold
+                <span class="t-mono text-fg-2" style="font-weight:400">DENY when ensemble risk ≥ this value</span>
+              </label>
+              <div class="input-with-unit" data-unit="0–1">
+                <input class="input" id="riskThreshold" type="number" step="0.01" min="0" max="1" value="${num(p.riskThreshold, 0.6)}" required>
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="mfaStepUpThreshold">MFA step-up threshold
+                <span class="t-mono text-fg-2" style="font-weight:400">STEP_UP when risk ≥ this value</span>
+              </label>
+              <div class="input-with-unit" data-unit="0–1">
+                <input class="input" id="mfaStepUpThreshold" type="number" step="0.01" min="0" max="1" value="${num(p.mfaStepUpThreshold, 0.3)}" required>
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="accessGrantTtlSeconds">Access-grant TTL
+                <span class="t-mono text-fg-2" style="font-weight:400">Lifetime of an issued AccessGrant on chain</span>
+              </label>
+              <div class="input-with-unit" data-unit="seconds">
+                <input class="input" id="accessGrantTtlSeconds" type="number" min="60" max="86400" step="60" value="${num(p.accessGrantTtlSeconds, 900)}" required>
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="zkpRequiredForAllow">ZKP required for ALLOW</label>
+              <select class="select" id="zkpRequiredForAllow">
+                <option value="true"  ${p.zkpRequiredForAllow !== false ? 'selected' : ''}>Required</option>
+                <option value="false" ${p.zkpRequiredForAllow === false ? 'selected' : ''}>Optional</option>
+              </select>
+            </div>
+
+            <div id="formErr" class="field-error hidden"></div>
+
+            <div class="flex gap-2 justify-end mt-4">
+              <button type="button" class="btn btn-ghost" id="reset">Reset</button>
+              <button type="submit" class="btn btn-primary" id="save">Submit on-chain</button>
+            </div>
+          </form>
+        </div>
+        <div class="card-foot">
+          <span>Changes write a transaction to <span class="t-mono">iam-cc</span> on channel <span class="t-mono">iamchannel</span>.</span>
+          <span class="t-mono">Org1MSP admin endorsement required</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="t-h2">Other on-chain values</div></div>
+        <div class="card-body">
+          <dl>
+            <div class="detail-row"><dt>ZKP scheme</dt><dd class="t-mono">${escape(p.zkpScheme || 'PedersenBitRangeProof')}</dd></div>
+            <div class="detail-row"><dt>Active model version</dt><dd class="t-mono">${escape(p.activeModelVersion || '—')}</dd></div>
+            <div class="detail-row"><dt>Role schema version</dt><dd class="t-mono">${escape(p.roleSchemaVersion || '—')}</dd></div>
+            <div class="detail-row"><dt>Authorized risk engines</dt><dd class="t-mono">${escape((p.authorizedRiskEngines || []).join(', ') || '—')}</dd></div>
+            <div class="detail-row"><dt>Authorized auditors</dt><dd class="t-mono">${escape((p.authorizedAuditors || []).join(', ') || '—')}</dd></div>
+          </dl>
+        </div>
+      </div>`;
+
+    $('#form').addEventListener('submit', submit);
+    $('#reset').addEventListener('click', load);
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    const btn = $('#save');
+    btn.disabled = true; btn.textContent = 'Submitting…';
+    const errBox = $('#formErr'); errBox.classList.add('hidden');
+    try {
+      const body = {
+        riskThreshold: parseFloat($('#riskThreshold').value),
+        mfaStepUpThreshold: parseFloat($('#mfaStepUpThreshold').value),
+        accessGrantTtlSeconds: parseInt($('#accessGrantTtlSeconds').value, 10),
+        zkpRequiredForAllow: $('#zkpRequiredForAllow').value === 'true',
+      };
+      if (body.mfaStepUpThreshold >= body.riskThreshold) {
+        throw new Error('MFA step-up threshold must be lower than risk threshold');
+      }
+      const resp = await post('/api/admin/policies', body);
+      toast('Policy updated · tx ' + (resp.txId || resp.updateTxId || '—').slice(0, 12), 'success');
+      await load();
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.classList.remove('hidden');
+      toast(err.message, 'error');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Submit on-chain';
+    }
+  }
+
+  function num(v, fallback) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  load();
+</script>
+</body>
+</html>

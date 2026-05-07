@@ -4,10 +4,15 @@
   "description": "Zero Trust IAM Smart Contract",
   "main": "index.js",
   "scripts": {
-    "start": "fabric-chaincode-node start"
+    "start": "fabric-chaincode-node start",
+    "test": "CHAINCODE_UNIT_TEST=1 jest --runInBand --forceExit",
+    "test:coverage": "CHAINCODE_UNIT_TEST=1 jest --coverage --runInBand --forceExit"
   },
   "dependencies": {
     "fabric-contract-api": "~2.5",
     "fabric-shim": "~2.5"
+  },
+  "devDependencies": {
+    "jest": "^30.0.0"
   }
 }

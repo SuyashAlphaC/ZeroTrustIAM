@@ -1,0 +1,7 @@
+# Removes the dev-only plaintext Secret from the inherited base bundle.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ztiam-secrets
+  namespace: ztiam
+$patch: delete

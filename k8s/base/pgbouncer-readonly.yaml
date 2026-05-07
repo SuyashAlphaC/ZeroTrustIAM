@@ -1,0 +1,42 @@
+# PgBouncer reader pool routed at hot-standby replicas.
+# Service exposed by the operator: ztiam-pg-ro (port 5432) — used by policy-engine
+# for read-only queries (audit listing, dashboards).
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: ztiam-pg-ro
+  namespace: ztiam
+spec:
+  cluster:
+    name: ztiam-pg
+  instances: 3
+  type: ro
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "20"
+      reserve_pool_size: "5"
+      reserve_pool_timeout: "3"
+      log_disconnections: "0"
+      log_connections: "0"
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    cnpg.io/poolerName: ztiam-pg-ro
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

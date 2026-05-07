@@ -122,6 +122,17 @@ const config = {
   ensembleAhpWeight: parseFloat(process.env.ENSEMBLE_AHP_WEIGHT || '0.4'),
   ensembleMlWeight: parseFloat(process.env.ENSEMBLE_ML_WEIGHT || '0.4'),
   ensembleAnomalyWeight: parseFloat(process.env.ENSEMBLE_ANOMALY_WEIGHT || '0.2'),
+
+  // KMS / Vault Transit (Tier A.1)
+  // KMS_BACKEND ∈ { 'local' (default, RSA key in Postgres signing_keys),
+  //                 'vault'  (HashiCorp Vault Transit — key never leaves Vault),
+  //                 'aws'    (AWS KMS — stub, NotImplemented) }
+  kmsBackend: process.env.KMS_BACKEND || 'local',
+  vaultAddr: process.env.VAULT_ADDR || 'http://vault:8200',
+  vaultToken: process.env.VAULT_TOKEN || '',
+  vaultTransitKeyName: process.env.VAULT_TRANSIT_KEY_NAME
+    || `ztiam-jwt-${process.env.NODE_ENV || 'dev'}`,
+  vaultTimeoutMs: parseInt(process.env.VAULT_TIMEOUT_MS || '3000', 10),
 };
 
 if (isProd) {
