@@ -1,0 +1,321 @@
+{
+  "generatedAt": "2026-05-18T15:06:05.991Z",
+  "schemaVersion": 2,
+  "configs": [
+    {
+      "configId": "baseline",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "no_ml",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 13,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 0,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.247,
+        "riskScenariosMfaRate": 0.25
+      }
+    },
+    {
+      "configId": "no_anomaly",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 13,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 0,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.385,
+        "riskScenariosMfaRate": 0.25
+      }
+    },
+    {
+      "configId": "ahp_only",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 13,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 0,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.251,
+        "riskScenariosMfaRate": 0.25
+      }
+    },
+    {
+      "configId": "ml_only",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 11,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 2,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.4,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.515,
+        "riskScenariosMfaRate": 0.75
+      }
+    },
+    {
+      "configId": "no_blockchain",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 10,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 2,
+        "securityRegressionsTotal": 2,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 0.6,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "no_policy_threshold",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "no_mfa",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 11,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 2,
+        "securityRegressionsTotal": 2,
+        "securityRegressions": 0,
+        "frictionRegressions": 0,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 0.6666666666666666,
+        "falsePositiveRate": 0,
+        "falseNegativeRate": 0.25,
+        "meanRiskScore": 0.349,
+        "riskScenariosMfaRate": 0
+      }
+    },
+    {
+      "configId": "no_zkp",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "ablate_device",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.35,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "ablate_location",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 11,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 2,
+        "securityRegressionsTotal": 2,
+        "securityRegressions": 0,
+        "frictionRegressions": 0,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 0.6666666666666666,
+        "falsePositiveRate": 0,
+        "falseNegativeRate": 0.25,
+        "meanRiskScore": 0.33,
+        "riskScenariosMfaRate": 0
+      }
+    },
+    {
+      "configId": "ablate_time",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.371,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "ablate_attempts",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.36,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "with_ml",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    },
+    {
+      "configId": "with_decision_cache",
+      "skipped": false,
+      "summary": {
+        "total": 13,
+        "matchesBaseline": 12,
+        "hardSecurityRegressions": 0,
+        "softSecurityRegressions": 0,
+        "securityRegressionsTotal": 0,
+        "securityRegressions": 0,
+        "frictionRegressions": 1,
+        "overDenyRegressions": 0,
+        "attackBlockRate": 1,
+        "benignAllowRate": 1,
+        "evasionBlockOrStepUpRate": 1,
+        "falsePositiveRate": 0.2,
+        "falseNegativeRate": 0,
+        "meanRiskScore": 0.355,
+        "riskScenariosMfaRate": 0.5
+      }
+    }
+  ]
+}

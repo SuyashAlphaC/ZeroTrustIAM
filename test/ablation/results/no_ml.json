@@ -1,0 +1,610 @@
+{
+  "configId": "no_ml",
+  "configName": "Without ML Random Forest",
+  "description": "Disables Python RF sidecar; ensemble redistributes ML weight to AHP + anomaly",
+  "env": {
+    "ML_SERVICE_ENABLED": "false",
+    "ENSEMBLE_AHP_WEIGHT": "0.4",
+    "ENSEMBLE_ML_WEIGHT": "0.4",
+    "ENSEMBLE_ANOMALY_WEIGHT": "0.2"
+  },
+  "mlServiceEnabled": false,
+  "mlAvailableAtStart": null,
+  "redisAvailable": null,
+  "riskThreshold": 0.6,
+  "mfaStepUpThreshold": 0.3,
+  "riskWeights": {
+    "device": 0.4,
+    "location": 0.3,
+    "time": 0.2,
+    "attempts": 0.1
+  },
+  "ensembleWeights": {
+    "ahp": 0.4,
+    "ml": 0.4,
+    "anomaly": 0.2
+  },
+  "zkpEnabled": true,
+  "blockchainAblation": null,
+  "cacheRun": null,
+  "summary": {
+    "total": 13,
+    "matchesBaseline": 13,
+    "hardSecurityRegressions": 0,
+    "softSecurityRegressions": 0,
+    "securityRegressionsTotal": 0,
+    "securityRegressions": 0,
+    "frictionRegressions": 0,
+    "overDenyRegressions": 0,
+    "attackBlockRate": 1,
+    "benignAllowRate": 1,
+    "evasionBlockOrStepUpRate": 1,
+    "falsePositiveRate": 0,
+    "falseNegativeRate": 0,
+    "meanRiskScore": 0.247,
+    "riskScenariosMfaRate": 0.25
+  },
+  "scenarios": [
+    {
+      "id": "legitimate_login",
+      "name": "Legitimate login (known device, home location, business hours)",
+      "category": "benign",
+      "baselineExpected": "ALLOW",
+      "decision": "ALLOW",
+      "reason": "All checks passed",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0,
+      "baseRiskScore": 0,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0,
+        "components": {
+          "ahp": 0,
+          "ml": 0,
+          "anomaly": 0.01
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.01,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "wrong_password",
+      "name": "Invalid password",
+      "category": "attack",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Invalid credentials - wrong password",
+      "layer": "Policy Engine",
+      "riskScore": null,
+      "baseRiskScore": null,
+      "anomalyMature": null,
+      "zkProofGenerated": false,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "unknown_user",
+      "name": "Non-existent user",
+      "category": "attack",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Invalid credentials - user not found",
+      "layer": "Policy Engine",
+      "riskScore": null,
+      "baseRiskScore": null,
+      "anomalyMature": null,
+      "zkProofGenerated": false,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "stolen_creds_unknown_device",
+      "name": "Valid password from unregistered device",
+      "category": "attack",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Unregistered device",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.31,
+      "baseRiskScore": 0.42,
+      "breakdown": {
+        "d_score": 1,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 0.2
+      },
+      "ensemble": {
+        "ensembleScore": 0.31,
+        "components": {
+          "ahp": 0.42,
+          "ml": 0,
+          "anomaly": 0.1
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.1,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "foreign_country",
+      "name": "Registered device, foreign country (Russia)",
+      "category": "risk",
+      "baselineExpected": "MFA_REQUIRED",
+      "decision": "MFA_REQUIRED",
+      "reason": "Step-up authentication required (risk=0.37)",
+      "layer": "Policy Engine (MFA)",
+      "riskScore": 0.37,
+      "baseRiskScore": 0.32,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 1,
+        "t_score": 0,
+        "a_score": 0.2
+      },
+      "ensemble": {
+        "ensembleScore": 0.37,
+        "components": {
+          "ahp": 0.32,
+          "ml": 0,
+          "anomaly": 0.46
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.46,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": false,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "off_hours",
+      "name": "Registered device, off-hours access (03:00 UTC)",
+      "category": "risk",
+      "baselineExpected": "ALLOW",
+      "decision": "ALLOW",
+      "reason": "All checks passed",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.04,
+      "baseRiskScore": 0.02,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 0.2
+      },
+      "ensemble": {
+        "ensembleScore": 0.04,
+        "components": {
+          "ahp": 0.02,
+          "ml": 0,
+          "anomaly": 0.07
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.07,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "privilege_escalation",
+      "name": "Viewer role requests delete permission",
+      "category": "attack",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Insufficient permissions",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.03,
+      "baseRiskScore": 0,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.03,
+        "components": {
+          "ahp": 0,
+          "ml": 0,
+          "anomaly": 0.08
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.08,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "cumulative_high_risk",
+      "name": "Unknown device + foreign country + off-hours + write",
+      "category": "attack",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Risk score too high (0.8 >= 0.6)",
+      "layer": "Policy Engine",
+      "riskScore": 0.8,
+      "baseRiskScore": 0.9,
+      "breakdown": {
+        "d_score": 1,
+        "l_score": 1,
+        "t_score": 1,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.8,
+        "components": {
+          "ahp": 0.9,
+          "ml": 0,
+          "anomaly": 0.61
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.61,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": false,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "post_bruteforce_login",
+      "name": "Correct password after 5 failed attempts (elevated a_score)",
+      "category": "risk",
+      "baselineExpected": "ALLOW",
+      "decision": "ALLOW",
+      "reason": "All checks passed",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.07,
+      "baseRiskScore": 0.1,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 1
+      },
+      "ensemble": {
+        "ensembleScore": 0.07,
+        "components": {
+          "ahp": 0.1,
+          "ml": 0,
+          "anomaly": 0.01
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.01,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "same_country_different_city",
+      "name": "Registered device, same country different city",
+      "category": "risk",
+      "baselineExpected": "ALLOW",
+      "decision": "ALLOW",
+      "reason": "All checks passed",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.23,
+      "baseRiskScore": 0.15,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0.5,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.23,
+        "components": {
+          "ahp": 0.15,
+          "ml": 0,
+          "anomaly": 0.39
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.39,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "evasion_perfect_mimic",
+      "name": "Stolen creds + stolen device + home location + normal hour (perfect mimic)",
+      "category": "evasion",
+      "baselineExpected": "ALLOW",
+      "decision": "ALLOW",
+      "reason": "All checks passed",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.06,
+      "baseRiskScore": 0,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 0,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.06,
+        "components": {
+          "ahp": 0,
+          "ml": 0,
+          "anomaly": 0.18
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.18,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "evasion_normal_hours_foreign_country",
+      "name": "Foreign country during target user normal hours (read)",
+      "category": "evasion",
+      "baselineExpected": "MFA_REQUIRED",
+      "decision": "MFA_REQUIRED",
+      "reason": "Step-up authentication required (risk=0.35)",
+      "layer": "Policy Engine (MFA)",
+      "riskScore": 0.35,
+      "baseRiskScore": 0.3,
+      "breakdown": {
+        "d_score": 0,
+        "l_score": 1,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.35,
+        "components": {
+          "ahp": 0.3,
+          "ml": 0,
+          "anomaly": 0.45
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.45,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": false,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    },
+    {
+      "id": "evasion_credential_stuffing_known_device",
+      "name": "Credential stuffing — wrong owner on registered device",
+      "category": "evasion",
+      "baselineExpected": "DENY",
+      "decision": "DENY",
+      "reason": "Unregistered device",
+      "layer": "Smart Contract (Hyperledger Fabric)",
+      "riskScore": 0.46,
+      "baseRiskScore": 0.55,
+      "breakdown": {
+        "d_score": 1,
+        "l_score": 0.5,
+        "t_score": 0,
+        "a_score": 0
+      },
+      "ensemble": {
+        "ensembleScore": 0.46,
+        "components": {
+          "ahp": 0.55,
+          "ml": 0,
+          "anomaly": 0.27
+        },
+        "weights": {
+          "ahp": 0.667,
+          "ml": 0,
+          "anomaly": 0.333
+        },
+        "mlAvailable": false,
+        "mlError": "disabled",
+        "mlModelVersion": null,
+        "mlExplanation": null
+      },
+      "anomalyCombined": 0.27,
+      "anomalyMature": null,
+      "mlAvailable": false,
+      "zkProofGenerated": true,
+      "matchesBaseline": true,
+      "hardSecurityRegression": false,
+      "softSecurityRegression": false,
+      "securityRegression": false,
+      "frictionRegression": false,
+      "overDenyRegression": false,
+      "isFalsePositive": false,
+      "isFalseNegative": false,
+      "secondPass": null
+    }
+  ]
+}
