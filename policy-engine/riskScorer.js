@@ -1,23 +1,7 @@
 'use strict';
 
 const config = require('./config');
-
-// In-memory failed attempt counter (keyed by username)
-const failedAttempts = new Map();
-
-function getFailedAttempts(username) {
-  return failedAttempts.get(username) || 0;
-}
-
-function incrementFailedAttempts(username) {
-  const current = getFailedAttempts(username);
-  failedAttempts.set(username, current + 1);
-  return current + 1;
-}
-
-function resetFailedAttempts(username) {
-  failedAttempts.set(username, 0);
-}
+const lockout = require('./accountLockout');
 
 /**
  * Compute the contextual risk score R for an authentication attempt.
@@ -26,8 +10,28 @@ function resetFailedAttempts(username) {
  *
  * Weights loaded from config (overridable via environment variables).
  * Defaults via AHP: w1=0.40, w2=0.30, w3=0.20, w4=0.10
+ *
+ * Failed-attempt counters are shared via accountLockout (Redis → Postgres → local).
  */
-function computeRiskScore(userProfile, requestContext) {
+
+async function getFailedAttempts(username) {
+  return lockout.getFailedAttempts(username);
+}
+
+async function incrementFailedAttempts(username) {
+  return lockout.incrementFailedAttempts(username);
+}
+
+async function resetFailedAttempts(username) {
+  return lockout.resetFailedAttempts(username);
+}
+
+/**
+ * @param {object} userProfile
+ * @param {object} requestContext
+ * @returns {Promise<{ score: number, breakdown: object }>}
+ */
+async function computeRiskScore(userProfile, requestContext) {
   const W1 = config.riskWeights.device;
   const W2 = config.riskWeights.location;
   const W3 = config.riskWeights.time;
@@ -49,9 +53,8 @@ function computeRiskScore(userProfile, requestContext) {
   const [startHour, endHour] = userProfile.normalHours;
   const t_score = (requestHour >= startHour && requestHour < endHour) ? 0 : 1;
 
-  // Attempt score: min(failed_attempts / 5, 1)
-  const attempts = getFailedAttempts(requestContext.username);
-  const a_score = Math.min(attempts / 5, 1);
+  // Attempt score: shared counter (Redis-backed when available)
+  const a_score = await lockout.getAttemptScore(requestContext.username);
 
   const score = W1 * d_score + W2 * l_score + W3 * t_score + W4 * a_score;
 

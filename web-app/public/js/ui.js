@@ -16,10 +16,11 @@ const ICONS = {
 const icon = (k) => `<svg class="nav-icon" viewBox="0 0 16 16">${ICONS[k] || ''}</svg>`;
 
 const ADMIN_NAV = [
-  { href: '/admin/policies', label: 'Policies', icon: 'policies' },
-  { href: '/admin/audit',    label: 'Audit Log', icon: 'audit' },
-  { href: '/admin/models',   label: 'ML Models', icon: 'models' },
+  { href: '/admin/overview', label: 'Overview',  icon: 'policies' },
   { href: '/admin/users',    label: 'Users',     icon: 'users' },
+  { href: '/admin/audit',    label: 'Audit Log', icon: 'audit' },
+  { href: '/admin/policies', label: 'Policies',  icon: 'policies' },
+  { href: '/admin/models',   label: 'ML Models', icon: 'models' },
 ];
 const USER_NAV = [
   { href: '/me/security', label: 'Security',  icon: 'security' },
@@ -204,11 +205,36 @@ export function fmtTime(ts) {
 export function fmtRelative(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
   const s = (Date.now() - d.getTime()) / 1000;
+  // Client clock skew or future-dated request timestamps
+  if (s < -5) {
+    const abs = Math.abs(s);
+    if (abs < 60) return 'in ' + Math.floor(abs) + 's';
+    if (abs < 3600) return 'in ' + Math.floor(abs / 60) + 'm';
+    return fmtTime(ts);
+  }
+  if (s < 5) return 'just now';
   if (s < 60) return Math.floor(s) + 's ago';
   if (s < 3600) return Math.floor(s / 60) + 'm ago';
   if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  return Math.floor(s / 86400) + 'd ago';
+  if (s < 86400 * 7) return Math.floor(s / 86400) + 'd ago';
+  return fmtTime(ts);
+}
+
+/** Local wall-clock time for tables (with UTC secondary line via fmtTime). */
+export function fmtLocalTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return String(ts);
+  try {
+    return d.toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  } catch {
+    return fmtTime(ts);
+  }
 }
 
 export function pageHead({ crumb, title, description, actions = '' }) {

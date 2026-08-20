@@ -8,8 +8,8 @@ export PATH="${BIN_DIR}:${PATH}"
 
 CHANNEL_NAME="iamchannel"
 CC_NAME="iam-cc"
-CC_VERSION="1.0"
-CC_SEQUENCE=1
+CC_VERSION="${CC_VERSION:-1.0}"
+CC_SEQUENCE="${CC_SEQUENCE:-1}"
 
 PEER1_TLS_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt"
 PEER2_TLS_CA="/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt"
@@ -80,8 +80,9 @@ echo "  Installed on Org2 peer."
 
 # Step 5: Get package ID
 echo "[5/9] Querying installed chaincode..."
+# Prefer the most recently installed package for this label (last match)
 PACKAGE_ID=$(docker exec cli peer lifecycle chaincode queryinstalled --output json | \
-  python3 -c "import sys,json; refs=json.load(sys.stdin).get('installed_chaincodes',[]); matching=[x for x in refs if '${CC_NAME}_${CC_VERSION}' in x.get('label','')]; print(matching[0]['package_id'] if matching else (refs[0]['package_id'] if refs else ''))")
+  python3 -c "import sys,json; refs=json.load(sys.stdin).get('installed_chaincodes',[]); matching=[x for x in refs if '${CC_NAME}_${CC_VERSION}' in x.get('label','')]; print(matching[-1]['package_id'] if matching else (refs[-1]['package_id'] if refs else ''))")
 
 if [ -z "$PACKAGE_ID" ]; then
   echo "  ERROR: Could not find installed chaincode package ID"
@@ -89,11 +90,13 @@ if [ -z "$PACKAGE_ID" ]; then
 fi
 echo "  Package ID: ${PACKAGE_ID}"
 
-# Step 6: Restart chaincode container with the correct CHAINCODE_ID
-echo "[6/9] Starting chaincode container with correct ID..."
+# Step 6: Rebuild + restart chaincode container with the correct CHAINCODE_ID
+# (CCaaS image embeds contract source — rebuild so CreateUser/etc. stay in sync)
+echo "[6/9] Building and starting chaincode container with correct ID..."
 cd "${NETWORK_DIR}"
 docker compose stop iam-chaincode 2>/dev/null || true
 docker compose rm -f iam-chaincode 2>/dev/null || true
+docker compose build iam-chaincode
 
 export CHAINCODE_CCID="${PACKAGE_ID}"
 docker compose up -d iam-chaincode

@@ -47,8 +47,6 @@ CREATE TABLE IF NOT EXISTS training_samples (
 CREATE INDEX IF NOT EXISTS idx_samples_created  ON training_samples(created_at);
 CREATE INDEX IF NOT EXISTS idx_samples_label    ON training_samples(label);
 CREATE INDEX IF NOT EXISTS idx_samples_source   ON training_samples(source);
-CREATE INDEX IF NOT EXISTS idx_samples_audit_id ON training_samples(audit_id);
-CREATE INDEX IF NOT EXISTS idx_samples_split    ON training_samples(split);
 
 CREATE TABLE IF NOT EXISTS retrain_runs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +91,13 @@ class TrainingDataset:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_columns(conn)
+            # Indexes that depend on migrated columns (safe after ALTER)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_samples_audit_id ON training_samples(audit_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_samples_split ON training_samples(split)"
+            )
             conn.commit()
 
     @contextmanager

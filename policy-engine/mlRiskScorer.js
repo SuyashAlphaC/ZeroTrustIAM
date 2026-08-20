@@ -228,6 +228,81 @@ async function mlHealth() {
   }
 }
 
+/** Admin lifecycle calls (info/drift/promote) can exceed the predict timeout. */
+function adminTimeoutMs() {
+  return Math.max(config.mlServiceTimeoutMs * 5, 5000);
+}
+
+/**
+ * Proxy an admin request to the ML sidecar.
+ * Returns { status, body } — never throws. Upstream FastAPI `detail` is normalized
+ * to `error`/`message` for the web-app client.
+ *
+ * @param {string} path  Path on the ML service, e.g. '/model/info'
+ * @param {{ method?: string, body?: object, auth?: boolean }} opts
+ */
+async function proxyAdminMl(path, opts = {}) {
+  if (!config.mlServiceEnabled) {
+    return { status: 503, body: { error: 'ML service disabled', message: 'ML service disabled' } };
+  }
+  const method = (opts.method || 'GET').toUpperCase();
+  const headers = { accept: 'application/json' };
+  if (opts.auth !== false) {
+    headers['x-ml-service-token'] = config.mlServiceToken;
+  }
+  const fetchOpts = { method, headers };
+  if (opts.body != null && method !== 'GET' && method !== 'HEAD') {
+    headers['content-type'] = 'application/json';
+    fetchOpts.body = JSON.stringify(opts.body);
+  }
+  try {
+    const res = await fetchWithTimeout(
+      `${config.mlServiceUrl}${path}`,
+      fetchOpts,
+      adminTimeoutMs()
+    );
+    let body = null;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      try { body = await res.json(); } catch { body = null; }
+    } else {
+      const text = await res.text().catch(() => '');
+      body = text ? { error: text, message: text } : null;
+    }
+    // Normalize FastAPI HTTPException shape for the SPA.
+    if (body && typeof body === 'object' && body.detail != null && body.error == null) {
+      const detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+      body = { ...body, error: detail, message: detail };
+    }
+    return { status: res.status, body: body == null ? {} : body };
+  } catch (err) {
+    logger.warn({ err: err.message, path }, 'ML admin proxy failed');
+    const msg = err.name === 'AbortError' ? 'ML service timeout' : (err.message || 'ML service unavailable');
+    return { status: 502, body: { error: msg, message: msg } };
+  }
+}
+
+async function mlModelInfo() {
+  // /model/info is unauthenticated on the sidecar (read-only observability).
+  return proxyAdminMl('/model/info', { method: 'GET', auth: false });
+}
+
+async function mlModelComparison() {
+  return proxyAdminMl('/model/comparison', { method: 'GET', auth: false });
+}
+
+async function mlFeatureDrift() {
+  return proxyAdminMl('/drift', { method: 'GET', auth: false });
+}
+
+async function mlPromoteCandidate() {
+  return proxyAdminMl('/model/promote', { method: 'POST', body: {}, auth: true });
+}
+
+async function mlRollbackChampion() {
+  return proxyAdminMl('/model/rollback', { method: 'POST', body: {}, auth: true });
+}
+
 module.exports = {
   scoreWithML,
   mlHealth,
@@ -236,4 +311,10 @@ module.exports = {
   deriveLabel,
   relabelMlSample,
   feedbackLabelToBinary,
+  proxyAdminMl,
+  mlModelInfo,
+  mlModelComparison,
+  mlFeatureDrift,
+  mlPromoteCandidate,
+  mlRollbackChampion,
 };

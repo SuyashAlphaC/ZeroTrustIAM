@@ -109,13 +109,28 @@ async function policyFetch(pathOrUrl, opts = {}) {
       incoming.on('data', (c) => chunks.push(c));
       incoming.on('end', () => {
         const buf = Buffer.concat(chunks);
+        const headers = incoming.headers || {};
         settle(null, {
           ok: incoming.statusCode >= 200 && incoming.statusCode < 300,
           status: incoming.statusCode,
+          headers: {
+            ...headers,
+            get(name) {
+              const key = String(name).toLowerCase();
+              const v = headers[key];
+              return Array.isArray(v) ? v[0] : (v || null);
+            },
+          },
           /** @returns {Promise<any>} */
           async json() {
             if (!buf.length) return {};
             return JSON.parse(buf.toString('utf8'));
+          },
+          async text() {
+            return buf.toString('utf8');
+          },
+          async arrayBuffer() {
+            return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
           },
         });
       });
@@ -338,7 +353,17 @@ app.post('/api/logout', async (req, res) => {
   res.json({ success: true, message: 'Logged out successfully' });
 });
 
-// ──────────────────── Proxy: WebAuthn ────────────────────
+// ──────────────────── Proxy: WebAuthn / MFA (session cookie → Bearer) ────────────────────
+
+function authHeadersFromRequest(req, extra = {}) {
+  const headers = { 'Content-Type': 'application/json', ...extra };
+  if (req.headers.authorization) {
+    headers.Authorization = req.headers.authorization;
+  } else if (req.cookies?.zt_access) {
+    headers.Authorization = `Bearer ${req.cookies.zt_access}`;
+  }
+  return headers;
+}
 
 const webauthnPaths = [
   '/webauthn/register/options',
@@ -351,8 +376,8 @@ for (const wpath of webauthnPaths) {
     try {
       const response = await policyFetch(wpath, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body),
+        headers: authHeadersFromRequest(req),
+        body: JSON.stringify(req.body || {}),
       });
       const result = await response.json();
       if (result.accessToken) {
@@ -369,7 +394,9 @@ for (const wpath of webauthnPaths) {
 
 app.get('/api/webauthn/status/:username', async (req, res) => {
   try {
-    const response = await policyFetch(`/webauthn/status/${req.params.username}`);
+    const response = await policyFetch(`/webauthn/status/${req.params.username}`, {
+      headers: authHeadersFromRequest(req),
+    });
     res.json(await response.json());
   } catch (err) {
     res.status(502).json({ error: 'Policy engine unavailable' });
@@ -382,8 +409,34 @@ app.post('/api/mfa/enroll', async (req, res) => {
   try {
     const response = await policyFetch('/mfa/enroll', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
+      headers: authHeadersFromRequest(req),
+      body: JSON.stringify(req.body || {}),
+    });
+    res.status(response.status).json(await response.json());
+  } catch (err) {
+    res.status(502).json({ error: 'Policy engine unavailable' });
+  }
+});
+
+app.post('/api/mfa/verify', async (req, res) => {
+  try {
+    const response = await policyFetch('/mfa/verify', {
+      method: 'POST',
+      headers: authHeadersFromRequest(req),
+      body: JSON.stringify(req.body || {}),
+    });
+    res.status(response.status).json(await response.json());
+  } catch (err) {
+    res.status(502).json({ error: 'Policy engine unavailable' });
+  }
+});
+
+app.post('/api/mfa/disable', async (req, res) => {
+  try {
+    const response = await policyFetch('/mfa/disable', {
+      method: 'POST',
+      headers: authHeadersFromRequest(req),
+      body: JSON.stringify(req.body || {}),
     });
     res.status(response.status).json(await response.json());
   } catch (err) {
@@ -395,8 +448,8 @@ app.post('/api/mfa/challenge', async (req, res) => {
   try {
     const response = await policyFetch('/mfa/challenge', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
+      headers: authHeadersFromRequest(req),
+      body: JSON.stringify(req.body || {}),
     });
     const result = await response.json();
     if (result.accessToken) {
@@ -412,7 +465,9 @@ app.post('/api/mfa/challenge', async (req, res) => {
 
 app.get('/api/mfa/status/:username', async (req, res) => {
   try {
-    const response = await policyFetch(`/mfa/status/${req.params.username}`);
+    const response = await policyFetch(`/mfa/status/${req.params.username}`, {
+      headers: authHeadersFromRequest(req),
+    });
     res.json(await response.json());
   } catch (err) {
     res.status(502).json({ error: 'Policy engine unavailable' });
@@ -462,13 +517,28 @@ app.get('/oauth/login', (req, res) => {
 // own role check client-side via /js/auth.js — server-side auth happens at
 // the /api/* proxy below, where the bearer token is required.
 
-const ADMIN_PAGES = ['policies', 'audit', 'models', 'users'];
+const ADMIN_PAGES = ['overview', 'policies', 'audit', 'models', 'users'];
 for (const page of ADMIN_PAGES) {
   app.get(`/admin/${page}`, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'admin', `${page}.html`));
   });
 }
-app.get('/admin', (_req, res) => res.redirect('/admin/policies'));
+// Dedicated operator console (HTML admin pages). Legacy React build remains at /admin-console.
+app.get('/admin', (_req, res) => res.redirect('/admin/overview'));
+
+// Modern React admin console (Vite build output under public/admin-console)
+app.use('/admin-console', express.static(path.join(__dirname, 'public', 'admin-console'), {
+  fallthrough: true,
+  index: 'index.html',
+}));
+app.get('/admin-console/*', (req, res, next) => {
+  const index = path.join(__dirname, 'public', 'admin-console', 'index.html');
+  if (require('fs').existsSync(index)) return res.sendFile(index);
+  // Dev fallback: point operators at Vite
+  res.status(503).send(
+    'Admin console not built. Run: cd admin-console && npm install && npm run build'
+  );
+});
 
 const ME_PAGES = ['security', 'devices', 'sessions', 'data'];
 for (const page of ME_PAGES) {
@@ -483,10 +553,18 @@ app.get('/me', (_req, res) => res.redirect('/me/security'));
 // token from the browser's session is forwarded as Authorization. CSRF
 // protection above already gates non-GET requests.
 
+/** Prefer browser Authorization; else promote HttpOnly zt_access cookie to Bearer. */
+function bearerFromRequest(req) {
+  if (req.headers.authorization) return req.headers.authorization;
+  const cookieTok = req.cookies?.zt_access;
+  if (cookieTok) return `Bearer ${cookieTok}`;
+  return null;
+}
+
 async function proxyToPolicyEngine(req, res) {
   const sub = req.originalUrl.replace(/^\/api/, '');
   const target = `/v1${sub}`;
-  const auth = req.headers.authorization;
+  const auth = bearerFromRequest(req);
   const headers = {};
   if (auth) headers.Authorization = auth;
   const opts = { method: req.method, headers };
@@ -496,6 +574,15 @@ async function proxyToPolicyEngine(req, res) {
   }
   try {
     const upstream = await policyFetch(target, opts);
+    const ct = (upstream.headers && (upstream.headers.get?.('content-type') || upstream.headers['content-type'])) || '';
+    // GDPR export and similar: stream raw body when not JSON or when Content-Disposition is attachment
+    const disp = upstream.headers?.get?.('content-disposition') || upstream.headers?.['content-disposition'] || '';
+    if (disp.includes('attachment') || (ct && !String(ct).includes('json'))) {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (ct) res.setHeader('Content-Type', ct);
+      if (disp) res.setHeader('Content-Disposition', disp);
+      return res.status(upstream.status).send(buf);
+    }
     let body = {};
     try { body = await upstream.json(); } catch { body = {}; }
     res.status(upstream.status).json(body);
@@ -509,6 +596,26 @@ async function proxyToPolicyEngine(req, res) {
 
 app.all('/api/admin/*', proxyToPolicyEngine);
 app.all('/api/me/*',    proxyToPolicyEngine);
+// Proxy /v1/* for admin-console SPA direct API calls
+app.all('/v1/*', async (req, res) => {
+  const target = req.originalUrl;
+  const auth = bearerFromRequest(req);
+  const headers = {};
+  if (auth) headers.Authorization = auth;
+  const opts = { method: req.method, headers };
+  if (!['GET', 'HEAD'].includes(req.method) && req.body && Object.keys(req.body).length) {
+    opts.body = JSON.stringify(req.body);
+    headers['Content-Type'] = 'application/json';
+  }
+  try {
+    const upstream = await policyFetch(target, opts);
+    let body = {};
+    try { body = await upstream.json(); } catch { body = {}; }
+    res.status(upstream.status).json(body);
+  } catch (err) {
+    res.status(502).json({ error: 'Upstream unavailable', detail: err.message });
+  }
+});
 
 // ──────────────────── Health Check ────────────────────
 

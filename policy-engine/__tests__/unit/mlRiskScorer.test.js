@@ -95,3 +95,80 @@ describe('scoreWithML', () => {
     expect(r.error).toBeTruthy();
   });
 });
+
+describe('proxyAdminMl / admin lifecycle helpers', () => {
+  let server;
+  let baseUrl;
+  let lastReq;
+
+  async function startServer(handler) {
+    await new Promise((resolve) => {
+      server = http.createServer((req, res) => {
+        lastReq = { method: req.method, url: req.url, headers: req.headers };
+        handler(req, res);
+      });
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address();
+    baseUrl = `http://127.0.0.1:${port}`;
+    process.env.ML_SERVICE_URL = baseUrl;
+    process.env.ML_SERVICE_ENABLED = 'true';
+    process.env.ML_SERVICE_TOKEN = 'test-ml-token';
+    jest.resetModules();
+  }
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise((resolve) => server.close(resolve));
+      server = null;
+    }
+  });
+
+  test('mlModelInfo forwards GET /model/info and returns body', async () => {
+    await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ meta: { model_version: 'v1', metrics: { accuracy: 0.9 } } }));
+    });
+    const { mlModelInfo } = require('../../mlRiskScorer');
+    const r = await mlModelInfo();
+    expect(r.status).toBe(200);
+    expect(r.body.meta.model_version).toBe('v1');
+    expect(lastReq.method).toBe('GET');
+    expect(lastReq.url).toBe('/model/info');
+  });
+
+  test('mlModelComparison normalizes FastAPI detail on 404', async () => {
+    await startServer((_req, res) => {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'no candidate model present' }));
+    });
+    const { mlModelComparison } = require('../../mlRiskScorer');
+    const r = await mlModelComparison();
+    expect(r.status).toBe(404);
+    expect(r.body.error).toBe('no candidate model present');
+    expect(r.body.message).toBe('no candidate model present');
+  });
+
+  test('mlPromoteCandidate sends service token on POST', async () => {
+    await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ promoted: true }));
+    });
+    const { mlPromoteCandidate } = require('../../mlRiskScorer');
+    const r = await mlPromoteCandidate();
+    expect(r.status).toBe(200);
+    expect(r.body.promoted).toBe(true);
+    expect(lastReq.method).toBe('POST');
+    expect(lastReq.url).toBe('/model/promote');
+    expect(lastReq.headers['x-ml-service-token']).toBe('test-ml-token');
+  });
+
+  test('returns 503 when ML disabled', async () => {
+    process.env.ML_SERVICE_ENABLED = 'false';
+    jest.resetModules();
+    const { mlFeatureDrift } = require('../../mlRiskScorer');
+    const r = await mlFeatureDrift();
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/disabled/i);
+  });
+});

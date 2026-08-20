@@ -44,6 +44,22 @@ const config = {
     attempts: parseFloat(process.env.RISK_WEIGHT_ATTEMPTS || '0.10'),
   },
 
+  /**
+   * When true, /evaluate may include raw riskScore/breakdown (debug only).
+   * Default false — production and normal clients never see scores.
+   * Set EXPOSE_RISK_DETAILS=true only for local model debugging.
+   */
+  exposeRiskDetails: process.env.EXPOSE_RISK_DETAILS === 'true',
+
+  /**
+   * How unknown device credentials are enrolled at login:
+   *  first_only | password | mfa | off
+   * Production default: first_only (TOFU for brand-new accounts only).
+   * Development default: password (enroll after password when risk is under threshold).
+   */
+  deviceEnrollMode: process.env.DEVICE_ENROLL_MODE
+    || (isProd ? 'first_only' : 'password'),
+
   // Anomaly detection
   anomalyWeight: parseFloat(process.env.ANOMALY_WEIGHT || '0.15'),
   anomalyThreshold: parseFloat(process.env.ANOMALY_THRESHOLD || '0.4'),
@@ -101,9 +117,20 @@ const config = {
   // Cleanup job interval (ms)
   cleanupInterval: parseInt(process.env.CLEANUP_INTERVAL_MS || '300000', 10),
 
-  // ZKP
-  zkpEnabled: process.env.ZKP_ENABLED !== 'false',
+  // ZKP — PERMANENTLY disabled by default. Custom EC proofs are not audited.
+  // Set ZKP_MODE=experimental to re-enable the demo implementation for research only.
+  // When ZKP_MODE is set (including 'disabled'), it wins over legacy ZKP_ENABLED.
+  zkpMode: (process.env.ZKP_MODE || (process.env.ZKP_ENABLED === 'true' ? 'experimental' : 'disabled')).toLowerCase(),
+  get zkpEnabled() {
+    const mode = (process.env.ZKP_MODE
+      || (process.env.ZKP_ENABLED === 'true' ? 'experimental' : 'disabled')).toLowerCase();
+    return mode === 'experimental';
+  },
   zkpExperimental: true,
+  /** When true, Fabric outage fails closed on evaluate (default). soft = AHP-only deny-on-high-risk without ledger. */
+  fabricFailureMode: process.env.FABRIC_FAILURE_MODE || 'fail_closed',
+  /** ML timeout already in mlServiceTimeoutMs; on timeout ensemble falls back to AHP+anomaly. */
+  mlFailureMode: process.env.ML_FAILURE_MODE || 'degrade', // degrade | fail_closed
 
   // Encryption for at-rest local secrets
   appEncryptionKey: isProd
@@ -117,6 +144,42 @@ const config = {
   mlServiceToken: mlEnabled
     ? (isProd ? requireEnv('ML_SERVICE_TOKEN') : (process.env.ML_SERVICE_TOKEN || 'dev-ml-service-token'))
     : null,
+
+  // ─── Lifecycle notifications (email / SMS) ───────────────────────────
+  /** Master switch. Default true — log mode still records intent without providers. */
+  notifyEnabled: process.env.NOTIFY_ENABLED !== 'false',
+  /**
+   * log  = structured logs + DB outbox only (safe default)
+   * smtp = real email when SMTP_* set; SMS log unless Twilio set
+   * full = email + SMS when both configured
+   */
+  notifyMode: (process.env.NOTIFICATION_MODE || 'log').toLowerCase(),
+  notifyOrgName: process.env.NOTIFY_ORG_NAME || 'ZeroTrust IAM',
+  notifyLoginUrl: process.env.NOTIFY_LOGIN_URL || process.env.OAUTH_CALLBACK_URL?.replace(/\/oauth\/callback$/, '') || 'http://localhost:3000',
+  /** Include temporary password in email body (never in SMS). Default false in production. */
+  notifyIncludeTempPassword: process.env.NOTIFY_INCLUDE_TEMP_PASSWORD === 'true'
+    || (!isProd && process.env.NOTIFY_INCLUDE_TEMP_PASSWORD !== 'false'),
+
+  get notifyEmailEnabled() {
+    const mode = (process.env.NOTIFICATION_MODE || 'log').toLowerCase();
+    if (mode === 'log') return false;
+    return !!(process.env.SMTP_HOST && process.env.SMTP_FROM);
+  },
+  get notifySmsEnabled() {
+    const mode = (process.env.NOTIFICATION_MODE || 'log').toLowerCase();
+    if (mode === 'log') return false;
+    if (mode === 'smtp' && process.env.NOTIFY_SMS !== 'true') return false;
+    return !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM);
+  },
+  smtpHost: process.env.SMTP_HOST || '',
+  smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
+  smtpSecure: process.env.SMTP_SECURE === 'true',
+  smtpUser: process.env.SMTP_USER || '',
+  smtpPass: process.env.SMTP_PASS || '',
+  smtpFrom: process.env.SMTP_FROM || 'noreply@zerotrust.local',
+  twilioAccountSid: process.env.TWILIO_ACCOUNT_SID || '',
+  twilioAuthToken: process.env.TWILIO_AUTH_TOKEN || '',
+  twilioFrom: process.env.TWILIO_FROM || '',
 
   // Ensemble weights: AHP + ML + anomaly (must sum to 1)
   ensembleAhpWeight: parseFloat(process.env.ENSEMBLE_AHP_WEIGHT || '0.4'),
@@ -141,6 +204,11 @@ if (isProd) {
   requireEnv('TLS_KEY_PATH');
   requireEnv('TLS_CERT_PATH');
   requireEnv('MTLS_CA_PATH');
+  // Prefer external KMS in production
+  if (config.kmsBackend === 'local') {
+    // eslint-disable-next-line no-console
+    console.warn('WARN: KMS_BACKEND=local in production — prefer vault or aws');
+  }
 }
 
 module.exports = config;

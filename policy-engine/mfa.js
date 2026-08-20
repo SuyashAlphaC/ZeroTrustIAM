@@ -58,6 +58,17 @@ async function isMFAEnabled(userId) {
 }
 
 /**
+ * Remove TOTP enrolment for a user (self-service or admin).
+ */
+async function disableMFA(userId) {
+  const removed = await db.deleteMFASecret(userId);
+  return {
+    disabled: removed,
+    message: removed ? 'Authenticator app removed' : 'MFA was not enrolled',
+  };
+}
+
+/**
  * Determine if MFA step-up is required based on risk score and operation.
  */
 function requiresStepUp(riskScore, requiredPermission) {
@@ -82,6 +93,7 @@ module.exports = {
   enrollMFA,
   verifyTOTP,
   isMFAEnabled,
+  disableMFA,
   requiresStepUp,
   seedDemoSecrets,
 };

@@ -9,20 +9,20 @@ describe('riskScorer', () => {
     normalHours: [8, 18],
   };
 
-  beforeEach(() => {
-    resetFailedAttempts('alice');
-    resetFailedAttempts('bob');
+  beforeEach(async () => {
+    await resetFailedAttempts('alice');
+    await resetFailedAttempts('bob');
   });
 
   describe('computeRiskScore', () => {
-    it('returns 0 for a fully trusted context', () => {
+    it('returns 0 for a fully trusted context', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
-        timestamp: '2026-04-02T10:00:00Z', // 3:30 PM IST = within 8-18
+        timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'IN', city: 'Gwalior' },
       };
-      const { score, breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { score, breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(score).toBe(0);
       expect(breakdown.d_score).toBe(0);
       expect(breakdown.l_score).toBe(0);
@@ -30,104 +30,101 @@ describe('riskScorer', () => {
       expect(breakdown.a_score).toBe(0);
     });
 
-    it('assigns d_score=1 for unknown device', () => {
+    it('assigns d_score=1 for unknown device', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'attacker-laptop',
         timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'IN', city: 'Gwalior' },
       };
-      const { score, breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { score, breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(breakdown.d_score).toBe(1);
-      expect(score).toBe(0.4); // 0.40 * 1
+      expect(score).toBe(0.4);
     });
 
-    it('assigns l_score=1 for foreign country', () => {
+    it('assigns l_score=1 for foreign country', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
         timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'RU', city: 'Moscow' },
       };
-      const { breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(breakdown.l_score).toBe(1);
     });
 
-    it('assigns l_score=0.5 for same country different city', () => {
+    it('assigns l_score=0.5 for same country different city', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
         timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'IN', city: 'Delhi' },
       };
-      const { breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(breakdown.l_score).toBe(0.5);
     });
 
-    it('assigns t_score=1 for off-hours login', () => {
-      // 20:00 UTC = 1:30 AM IST (next day), outside 8-18
+    it('assigns t_score=1 for off-hours login', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
         timestamp: '2026-04-02T20:00:00Z',
         location: { country: 'IN', city: 'Gwalior' },
       };
-      const { breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(breakdown.t_score).toBe(1);
     });
 
-    it('computes cumulative risk correctly', () => {
-      // Unknown device + foreign country + off-hours
+    it('computes cumulative risk correctly', async () => {
       const ctx = {
         username: 'alice',
         deviceId: 'hacker-dev',
         timestamp: '2026-04-02T20:00:00Z',
         location: { country: 'CN', city: 'Beijing' },
       };
-      const { score } = computeRiskScore(aliceProfile, ctx);
-      // R = 0.40*1 + 0.30*1 + 0.20*1 + 0.10*0 = 0.90
+      const { score } = await computeRiskScore(aliceProfile, ctx);
       expect(score).toBe(0.9);
     });
   });
 
   describe('failedAttempts', () => {
-    it('increments and tracks failed attempts', () => {
-      expect(getFailedAttempts('alice')).toBe(0);
-      incrementFailedAttempts('alice');
-      incrementFailedAttempts('alice');
-      expect(getFailedAttempts('alice')).toBe(2);
+    it('increments and tracks failed attempts', async () => {
+      expect(await getFailedAttempts('alice')).toBe(0);
+      await incrementFailedAttempts('alice');
+      await incrementFailedAttempts('alice');
+      expect(await getFailedAttempts('alice')).toBe(2);
     });
 
-    it('resets failed attempts', () => {
-      incrementFailedAttempts('alice');
-      incrementFailedAttempts('alice');
-      resetFailedAttempts('alice');
-      expect(getFailedAttempts('alice')).toBe(0);
+    it('resets failed attempts', async () => {
+      await incrementFailedAttempts('alice');
+      await incrementFailedAttempts('alice');
+      await resetFailedAttempts('alice');
+      expect(await getFailedAttempts('alice')).toBe(0);
     });
 
-    it('caps a_score at 1.0', () => {
-      for (let i = 0; i < 10; i++) incrementFailedAttempts('alice');
+    it('caps a_score at 1.0', async () => {
+      for (let i = 0; i < 10; i++) await incrementFailedAttempts('alice');
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
         timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'IN', city: 'Gwalior' },
       };
-      const { breakdown } = computeRiskScore(aliceProfile, ctx);
+      const { breakdown } = await computeRiskScore(aliceProfile, ctx);
       expect(breakdown.a_score).toBe(1);
     });
 
-    it('computes a_score proportionally', () => {
-      incrementFailedAttempts('alice');
-      incrementFailedAttempts('alice');
+    it('computes a_score proportionally', async () => {
+      await incrementFailedAttempts('alice');
+      await incrementFailedAttempts('alice');
       const ctx = {
         username: 'alice',
         deviceId: 'dev-001',
         timestamp: '2026-04-02T10:00:00Z',
         location: { country: 'IN', city: 'Gwalior' },
       };
-      const { breakdown } = computeRiskScore(aliceProfile, ctx);
-      expect(breakdown.a_score).toBeCloseTo(0.4); // 2/5
+      const { breakdown } = await computeRiskScore(aliceProfile, ctx);
+      expect(breakdown.a_score).toBeCloseTo(0.4);
     });
   });
 });

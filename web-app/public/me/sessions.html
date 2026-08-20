@@ -12,7 +12,7 @@
   import { renderShell, pageHead, hashCopy, fmtRelative, fmtTime, toast, confirm, escape } from '/js/ui.js';
   import { get, del, post } from '/js/api.js';
 
-  requireAuth();
+  await requireAuth();
   const main = renderShell({ section: 'me', currentPath: '/me/sessions' });
   main.innerHTML = pageHead({
     crumb: 'Account / Sessions',

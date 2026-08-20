@@ -14,8 +14,8 @@
  *     Vault — sign/verify operations are HTTP round-trips against the
  *     Transit engine. JWKS is built from the Vault-published public key.
  *
- *   • 'aws': AWS KMS (asymmetric RSA_3072 + RSASSA_PKCS1_V1_5_SHA_256).
- *     Stub-only for now; calls throw `NotImplemented`.
+ *   • 'aws': AWS KMS (asymmetric RSA_2048/3072 + RSASSA_PKCS1_V1_5_SHA_256).
+ *     Requires AWS_KMS_KEY_ID (or alias) and standard AWS credentials.
  *
  * Public surface:
  *   async signJwt(payload, options) -> JWT string (RS256, kid set)
@@ -380,26 +380,115 @@ class VaultTransitSigner {
   }
 }
 
-// ────────────────── AwsKmsSigner (stub) ──────────────────
+// ────────────────── AwsKmsSigner ──────────────────
 
-class NotImplementedError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'NotImplementedError';
+class AwsKmsSigner {
+  /**
+   * Signs JWTs with an asymmetric CMK in AWS KMS. Private key never leaves KMS.
+   *
+   * Env:
+   *   AWS_KMS_KEY_ID     — key id, ARN, or alias/xxx
+   *   AWS_REGION         — region (default us-east-1)
+   *   AWS_KMS_KEY_SPEC   — RSA_2048 | RSA_3072 | RSA_4096 (informational)
+   * Optional per-tenant override via constructor opts.keyId (CMK).
+   */
+  constructor(opts = {}) {
+    this.keyId = opts.keyId || process.env.AWS_KMS_KEY_ID || process.env.AWS_KMS_KEY_ARN || '';
+    this.region = opts.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
+    this.kid = opts.kid || (this.keyId ? `aws-kms:${this.keyId.split('/').pop()}` : null);
+    this._client = null;
+    this._publicPem = null;
+    this._jwk = null;
+    this._initPromise = null;
+  }
+
+  _getClient() {
+    if (this._client) return this._client;
+    // Lazy require so local/vault backends do not need the SDK installed path at load
+    // eslint-disable-next-line global-require
+    const { KMSClient } = require('@aws-sdk/client-kms');
+    this._client = new KMSClient({ region: this.region });
+    return this._client;
+  }
+
+  async _ensurePublic() {
+    if (this._publicPem) return;
+    if (!this._initPromise) {
+      this._initPromise = (async () => {
+        if (!this.keyId) throw new Error('AWS_KMS_KEY_ID is required when KMS_BACKEND=aws');
+        // eslint-disable-next-line global-require
+        const { GetPublicKeyCommand } = require('@aws-sdk/client-kms');
+        const client = this._getClient();
+        const out = await client.send(new GetPublicKeyCommand({ KeyId: this.keyId }));
+        // PublicKey is DER SPKI
+        const der = Buffer.from(out.PublicKey);
+        const pub = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+        this._publicPem = pub.export({ type: 'spki', format: 'pem' });
+        this._jwk = pemToJwk(this._publicPem, this.kid);
+        if (out.KeyId) this.kid = `aws-kms:${String(out.KeyId).split('/').pop()}`;
+        this._jwk.kid = this.kid;
+        logger.info({ kid: this.kid, keyId: this.keyId }, 'AWS KMS public key loaded');
+      })();
+    }
+    await this._initPromise;
+  }
+
+  async signJwt(payload, options = {}) {
+    await this._ensurePublic();
+    const claims = buildClaims(payload, options);
+    const header = { alg: 'RS256', typ: 'JWT', kid: this.kid };
+    const signingInput = `${base64urlJson(header)}.${base64urlJson(claims)}`;
+
+    // eslint-disable-next-line global-require
+    const { SignCommand } = require('@aws-sdk/client-kms');
+    const client = this._getClient();
+    const out = await client.send(new SignCommand({
+      KeyId: this.keyId,
+      Message: Buffer.from(signingInput, 'utf8'),
+      MessageType: 'RAW',
+      SigningAlgorithm: 'RSASSA_PKCS1_V1_5_SHA_256',
+    }));
+    const sig = base64url(Buffer.from(out.Signature));
+    return `${signingInput}.${sig}`;
+  }
+
+  async verifyJwt(token, options = {}) {
+    await this._ensurePublic();
+    return jwt.verify(token, this._publicPem, {
+      algorithms: ['RS256'],
+      ...options,
+    });
+  }
+
+  async getPublicJwks() {
+    await this._ensurePublic();
+    return { keys: [this._jwk] };
+  }
+
+  /**
+   * AWS KMS asymmetric keys are not rotated in-place the same way as symmetric.
+   * Rotation = create new key version / new CMK and update AWS_KMS_KEY_ID.
+   * This method refreshes the cached public key for the configured KeyId.
+   */
+  async rotate() {
+    this._publicPem = null;
+    this._jwk = null;
+    this._initPromise = null;
+    await this._ensurePublic();
+    return { kid: this.kid, keyId: this.keyId, note: 'Refreshed public key; create a new CMK in AWS to rotate material' };
+  }
+
+  getActiveKid() {
+    return this.kid;
   }
 }
 
-class AwsKmsSigner {
-  // eslint-disable-next-line class-methods-use-this
-  async signJwt() { throw new NotImplementedError('AWS KMS signer is not implemented yet'); }
-  // eslint-disable-next-line class-methods-use-this
-  async verifyJwt() { throw new NotImplementedError('AWS KMS signer is not implemented yet'); }
-  // eslint-disable-next-line class-methods-use-this
-  async getPublicJwks() { throw new NotImplementedError('AWS KMS signer is not implemented yet'); }
-  // eslint-disable-next-line class-methods-use-this
-  async rotate() { throw new NotImplementedError('AWS KMS signer is not implemented yet'); }
-  // eslint-disable-next-line class-methods-use-this
-  getActiveKid() { return null; }
+/**
+ * Tenant CMK signer factory — uses tenant-specific key ARN when provided.
+ * @param {string} keyId
+ */
+function createAwsTenantSigner(keyId) {
+  return new AwsKmsSigner({ keyId, kid: `aws-kms-tenant:${String(keyId).split('/').pop()}` });
 }
 
 // ────────────────── Selector / module API ──────────────────
@@ -474,10 +563,10 @@ module.exports = {
   selfTest,
   getSigner,
   createSigner,
+  createAwsTenantSigner,
   _setSigner,
   LocalSigner,
   VaultTransitSigner,
   AwsKmsSigner,
   VaultUnavailableError,
-  NotImplementedError,
 };

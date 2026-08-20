@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin Console · ZeroTrust IAM</title>
+  <link rel="stylesheet" href="/styles/ztiam.css">
+</head>
+<body>
+<script type="module">
+  import { requireRole } from '/js/auth.js';
+  import { renderShell, pageHead, toast, escape, fmtRelative } from '/js/ui.js';
+  import { get } from '/js/api.js';
+
+  await requireRole('admin');
+  const main = renderShell({ section: 'admin', currentPath: '/admin/overview' });
+  main.innerHTML = pageHead({
+    crumb: 'Governance / Overview',
+    title: '<em>Admin</em> console',
+    description: 'Identity lifecycle, access decisions, and operational health for ZeroTrust IAM.',
+    actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>
+              <a class="btn btn-primary" href="/admin/users">Manage users</a>`,
+  }) + `<div id="content"><div class="empty"><p>Loading overview…</p></div></div>`;
+
+  const $ = (s) => document.querySelector(s);
+
+  async function load() {
+    try {
+      const o = await get('/api/admin/overview');
+      render(o);
+    } catch (err) {
+      $('#content').innerHTML = `<div class="empty"><h3>Couldn't load overview</h3><p>${escape(err.message)}</p></div>`;
+    }
+  }
+
+  function render(o) {
+    const mlOk = o.ml?.ok;
+    const mlLabel = o.ml?.enabled === false ? 'disabled' : (mlOk ? 'healthy' : 'degraded');
+    const mlPill = o.ml?.enabled === false ? 'muted' : (mlOk ? 'allow' : 'stepup');
+
+    $('#content').innerHTML = `
+      <div class="stat-grid">
+        <div class="stat">
+          <div class="stat-label">Active users</div>
+          <div class="stat-value">${escape(o.activeUsers ?? 0)}</div>
+          <div class="stat-meta">${escape(o.suspendedUsers ?? 0)} suspended · ${escape(o.deletedUsers ?? 0)} deleted</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Total accounts</div>
+          <div class="stat-value">${escape(o.totalUsers ?? 0)}</div>
+          <div class="stat-meta">${escape(o.totalDevices ?? 0)} devices registered</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Live sessions</div>
+          <div class="stat-value">${escape(o.activeSessions ?? 0)}</div>
+          <div class="stat-meta">refresh tokens still valid</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Audit (24h)</div>
+          <div class="stat-value">${escape(o.auditLast24h ?? 0)}</div>
+          <div class="stat-meta">local audit rows written</div>
+        </div>
+      </div>
+
+      <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5);margin-top:var(--s-5)">
+        <div class="card">
+          <div class="card-head"><div class="t-h2">Operator tasks</div></div>
+          <div class="card-body">
+            <div class="flex flex-col gap-3">
+              <a class="btn btn-primary" href="/admin/users" style="justify-content:flex-start">Register or manage users</a>
+              <a class="btn btn-secondary" href="/admin/audit" style="justify-content:flex-start">Review audit log</a>
+              <a class="btn btn-secondary" href="/admin/policies" style="justify-content:flex-start">Policy parameters</a>
+              <a class="btn btn-secondary" href="/admin/models" style="justify-content:flex-start">ML model lifecycle</a>
+            </div>
+            <p class="t-small text-fg-2 mt-4">
+              New employees: create under Users → they log in from their browser (device binds automatically).
+              Leavers: suspend first, then evict to redact PII.
+            </p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div class="t-h2">System health</div></div>
+          <div class="card-body">
+            <dl>
+              <div class="detail-row">
+                <dt>ML sidecar</dt>
+                <dd><span class="pill ${mlPill} pill-no-dot">${escape(mlLabel)}</span></dd>
+              </div>
+              <div class="detail-row">
+                <dt>Risk threshold</dt>
+                <dd class="t-mono">${escape(o.riskThreshold ?? '—')}</dd>
+              </div>
+              <div class="detail-row">
+                <dt>Device enroll mode</dt>
+                <dd class="t-mono">${escape(o.deviceEnrollMode || '—')}</dd>
+              </div>
+              <div class="detail-row">
+                <dt>Fabric failure mode</dt>
+                <dd class="t-mono">${escape(o.fabric?.mode || 'fail_closed')}</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mt-5">
+        <div class="card-head"><div class="t-h2">Identity lifecycle (cheat sheet)</div></div>
+        <div class="card-body">
+          <table class="table" style="background:transparent">
+            <thead><tr><th>Step</th><th>Action</th><th>Where</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Create account (role + temp password)</td><td><a href="/admin/users">Users → New user</a></td></tr>
+              <tr><td>2</td><td>User signs in; browser device binds privately</td><td>Login portal</td></tr>
+              <tr><td>3</td><td>Suspend on leave / incident</td><td>Users → Suspend</td></tr>
+              <tr><td>4</td><td>Revoke all sessions</td><td>Users → Revoke sessions</td></tr>
+              <tr><td>5</td><td>Evict (redact PII, mark deleted)</td><td>Users → Evict</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  document.getElementById('refresh').addEventListener('click', () => {
+    load().then(() => toast('Overview refreshed', 'success'));
+  });
+  load();
+</script>
+</body>
+</html>

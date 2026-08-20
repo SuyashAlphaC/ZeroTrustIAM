@@ -1,11 +1,9 @@
 'use strict';
 
-const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Joi = require('joi');
 const config = require('./config');
-const db = require('./database');
 
 // ──────────────────────── Helmet (security headers) ────────────────────────
 
@@ -35,7 +33,7 @@ const authLimiter = rateLimit({
 // ──────────────────────── JWT Auth Middleware ────────────────────────
 
 /**
- * Middleware that requires a valid JWT access token.
+ * Middleware that requires a valid JWT access token (RS256 via kmsSigner).
  * Populates req.user with { sub, role, type }.
  */
 function requireAuth(req, res, next) {
@@ -45,21 +43,17 @@ function requireAuth(req, res, next) {
   }
 
   const token = authHeader.split(' ')[1];
-  db.getActiveSigningKey('jwt').then((jwtKey) => {
-    if (!jwtKey) {
-      return res.status(500).json({ error: 'Server configuration error' });
-    }
-    try {
-      const decoded = jwt.verify(token, jwtKey.private_key, { issuer: config.jwtIssuer });
+  // Lazy-require to avoid circular init with kmsSigner → database → config
+  const kmsSigner = require('./kmsSigner');
+  kmsSigner.verifyJwt(token, { issuer: config.jwtIssuer })
+    .then((decoded) => {
       if (decoded.type !== 'access') {
         return res.status(401).json({ error: 'Invalid token type', code: 'INVALID_TOKEN_TYPE' });
       }
       req.user = decoded;
       next();
-    } catch (_err) {
-      return res.status(401).json({ error: 'Token expired or invalid', code: 'INVALID_TOKEN' });
-    }
-  }).catch(next);
+    })
+    .catch(() => res.status(401).json({ error: 'Token expired or invalid', code: 'INVALID_TOKEN' }));
 }
 
 /**
@@ -169,11 +163,12 @@ const schemas = {
     reason: Joi.string().max(200).optional(),
   }),
 
-  // POST /admin/policy/public-params
+  // POST /admin/policy/public-params and POST /admin/policies
   updatePolicyPublicParams: Joi.object({
     policyId: Joi.string().max(100).optional(),
     policyVersion: Joi.string().max(40).optional(),
     riskThreshold: Joi.number().min(0.01).max(1).optional(),
+    mfaStepUpThreshold: Joi.number().min(0).max(1).optional(),
     zkpScheme: Joi.string().valid('PedersenBitRangeProof').optional(),
     zkpRequiredForAllow: Joi.boolean().optional(),
     accessGrantTtlSeconds: Joi.number().integer().min(30).max(86400).optional(),
@@ -214,13 +209,56 @@ const schemas = {
   // User registration
   createUser: Joi.object({
     userId: Joi.string().alphanum().min(2).max(50).required(),
-    password: Joi.string().min(6).max(128).required(),
+    password: Joi.string().min(12).max(128).required(),
     role: Joi.string().valid('admin', 'viewer', 'editor').optional(),
+    email: Joi.string().email().max(200).optional().allow('', null),
+    phone: Joi.string().max(30).pattern(/^\+?[0-9\s\-().]{7,30}$/).optional().allow('', null),
     usualCountry: Joi.string().max(10).optional(),
     usualCity: Joi.string().max(100).optional(),
     normalHoursStart: Joi.number().integer().min(0).max(23).optional(),
     normalHoursEnd: Joi.number().integer().min(0).max(23).optional(),
     devices: Joi.array().items(Joi.string().max(100)).optional(),
+  }),
+
+  changePassword: Joi.object({
+    currentPassword: Joi.string().min(1).max(128).required(),
+    newPassword: Joi.string().min(12).max(128).required(),
+  }),
+
+  registerOwnDevice: Joi.object({
+    deviceId: Joi.string().max(100).required(),
+    label: Joi.string().max(100).optional().allow('', null),
+  }),
+
+  requestPasswordReset: Joi.object({
+    username: Joi.string().alphanum().min(2).max(50).required(),
+  }),
+
+  completePasswordReset: Joi.object({
+    token: Joi.string().min(20).max(200).required(),
+    newPassword: Joi.string().min(12).max(128).required(),
+  }),
+
+  abacPolicy: Joi.object({
+    policyId: Joi.string().max(100).required(),
+    effect: Joi.string().valid('permit', 'forbid').required(),
+    principal: Joi.object().optional(),
+    action: Joi.array().items(Joi.string()).optional(),
+    resource: Joi.object().optional(),
+    when: Joi.object().optional(),
+    description: Joi.string().max(500).optional(),
+  }),
+
+  abacEvaluate: Joi.object({
+    userId: Joi.string().alphanum().min(2).max(50).required(),
+    role: Joi.string().max(50).optional(),
+    action: Joi.string().valid('read', 'write', 'delete', 'manage').required(),
+    resourceId: Joi.string().max(200).optional(),
+    resourceType: Joi.string().max(100).optional(),
+    riskScore: Joi.number().min(0).max(1).optional(),
+    country: Joi.string().max(10).optional(),
+    mfaVerified: Joi.boolean().optional(),
+    status: Joi.string().max(20).optional(),
   }),
 };
 

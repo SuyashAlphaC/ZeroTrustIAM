@@ -20,13 +20,13 @@
 
 ### Boundary 2: Web App <-> Policy Engine
 - **Trust level**: SEMI-TRUSTED. Web app only relays; makes no decisions.
-- **Controls**: The web app proxies requests without interpretation. The policy engine independently validates all inputs.
-- **Assumption**: Both services run on the same host or a trusted network. In production, use mTLS between services.
+- **Controls**: The web app proxies requests without interpretation. The policy engine independently validates all inputs. Production path uses **mTLS** (service client cert required except public OIDC/health routes).
+- **Assumption**: Both services run on a trusted network or mesh; browsers never hold the mTLS client key.
 
 ### Boundary 3: Policy Engine <-> Database
-- **Trust level**: TRUSTED. SQLite is an embedded database in the same process.
-- **Controls**: Parameterized queries (prepared statements via better-sqlite3, immune to SQL injection). WAL mode for concurrent access.
-- **Assumption**: The filesystem is secure. In production, encrypt the database file at rest (OS-level or application-level encryption).
+- **Trust level**: TRUSTED. **PostgreSQL** (not SQLite) is required via `DATABASE_URL`.
+- **Controls**: Parameterized queries (`pg`), connection pooling / PgBouncer in k8s, optional read replica URL.
+- **Assumption**: Postgres is not exposed to the public internet; credentials come from Vault/ExternalSecrets in production.
 
 ### Boundary 4: Policy Engine <-> Hyperledger Fabric
 - **Trust level**: TRUSTED with TLS verification.
@@ -39,7 +39,7 @@
 
 2. **Real-Fabric dependency**: The policy engine now depends on the real Hyperledger Fabric client path for authorization decisions. If Fabric is unavailable, access evaluation fails closed rather than falling back to an in-memory mock.
 
-3. **ZKP is experimental**: The Pedersen commitment range proof is a demonstration of the protocol, not a production-grade implementation. It should not be relied upon for security-critical decisions. See `zkpVerifier.js` header for upgrade path.
+3. **ZKP is experimental and opt-in**: Pedersen range proofs are disabled by default (`ZKP_ENABLED=true` to enable). They are **not a security boundary** (`securityBoundary: false`) and must not be the sole authorization control. See `zkpVerifier.js` and `docs/SLO_AND_FAILURE_MODES.md`.
 
 4. **Anomaly detector cold-start**: With fewer than 3 login samples, the time anomaly detector returns 0 (no anomaly). An attacker who acts during the cold-start window will not trigger time-based anomaly detection.
 

@@ -206,15 +206,34 @@ jobs:
           context: ./ml-service
           push: false
           cache-from: type=gha
+          tags: ztiam-ml-service:pr
       - name: Build policy-engine (no push)
         uses: docker/build-push-action@v5
         with:
           context: ./policy-engine
           push: false
           cache-from: type=gha
+          tags: ztiam-policy-engine:pr
       - name: Build web-app (no push)
         uses: docker/build-push-action@v5
         with:
           context: ./web-app
           push: false
           cache-from: type=gha
+          tags: ztiam-web-app:pr
+      - name: Trivy scan policy-engine image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ztiam-policy-engine:pr
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+      - name: Trivy scan web-app image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ztiam-web-app:pr
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true

@@ -111,6 +111,24 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
       OAUTH_DEFAULT_CLIENT_SECRET: ${OAUTH_DEFAULT_CLIENT_SECRET:?OAUTH_DEFAULT_CLIENT_SECRET is required}
       SEED_DEMO: ${SEED_DEMO:-false}
+      # Production posture: never leak risk scores; enroll only first device TOFU
+      EXPOSE_RISK_DETAILS: "false"
+      DEVICE_ENROLL_MODE: ${DEVICE_ENROLL_MODE:-password}
+      # Lifecycle notifications: log | smtp | full (set SMTP_*/TWILIO_* for real delivery)
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED:-true}
+      NOTIFICATION_MODE: ${NOTIFICATION_MODE:-log}
+      NOTIFY_ORG_NAME: ${NOTIFY_ORG_NAME:-ZeroTrust IAM}
+      NOTIFY_LOGIN_URL: ${NOTIFY_LOGIN_URL:-http://localhost:3000}
+      NOTIFY_INCLUDE_TEMP_PASSWORD: ${NOTIFY_INCLUDE_TEMP_PASSWORD:-true}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@zerotrust.local}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM: ${TWILIO_FROM:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-zt-iam-policy-engine}
     volumes:
@@ -122,10 +140,11 @@ services:
     ports:
       - "4000:4000"
     healthcheck:
+      # Image has wget (not curl). /health is mTLS-exempt so plain HTTPS works.
       test:
         [
           "CMD-SHELL",
-          "curl -sf --cacert /app/certs/internal/ca.pem --cert /app/certs/internal/web-client.pem --key /app/certs/internal/web-client-key.pem https://127.0.0.1:4000/health >/dev/null || exit 1",
+          "wget -qO- --no-check-certificate https://127.0.0.1:4000/health 2>/dev/null | grep -q healthy || exit 1",
         ]
       interval: 15s
       timeout: 5s

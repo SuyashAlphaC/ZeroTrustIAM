@@ -27,6 +27,11 @@ const testLedger = {
   grants: new Map(),
   dids: new Map(),
   vcs: new Map(),
+  /** @type {Map<string, { userId: string, role: string, registeredDevices: string[], status: string }>} */
+  users: new Map([
+    ['alice', { userId: 'alice', role: 'admin', registeredDevices: ['dev-001'], status: 'ACTIVE' }],
+    ['bob', { userId: 'bob', role: 'viewer', registeredDevices: ['dev-002'], status: 'ACTIVE' }],
+  ]),
   models: new Map([
     ['rules-ahp-v1', {
       modelVersion: 'rules-ahp-v1',
@@ -140,10 +145,10 @@ function connectGateway(peerClient, options = {}) {
     client: peerClient,
     identity: newIdentity(),
     signer: newSigner(),
-    evaluateOptions: () => ({ deadline: Date.now() + (options.evaluateDeadlineMs || 5000) }),
-    endorseOptions: () => ({ deadline: Date.now() + (options.endorseDeadlineMs || 15000) }),
-    submitOptions: () => ({ deadline: Date.now() + (options.submitDeadlineMs || 5000) }),
-    commitStatusOptions: () => ({ deadline: Date.now() + (options.commitDeadlineMs || 60000) }),
+    evaluateOptions: () => ({ deadline: Date.now() + (options.evaluateDeadlineMs || parseInt(process.env.FABRIC_EVALUATE_DEADLINE_MS || '10000', 10)) }),
+    endorseOptions: () => ({ deadline: Date.now() + (options.endorseDeadlineMs || parseInt(process.env.FABRIC_ENDORSE_DEADLINE_MS || '60000', 10)) }),
+    submitOptions: () => ({ deadline: Date.now() + (options.submitDeadlineMs || parseInt(process.env.FABRIC_SUBMIT_DEADLINE_MS || '15000', 10)) }),
+    commitStatusOptions: () => ({ deadline: Date.now() + (options.commitDeadlineMs || parseInt(process.env.FABRIC_COMMIT_DEADLINE_MS || '90000', 10)) }),
   });
 }
 
@@ -224,18 +229,66 @@ function mockIssueGrant({ txId, userId, deviceId, requiredPermission, options })
   return grant;
 }
 
-async function mockEvaluateAccess(userId, deviceId, riskScore, requiredPermission, options) {
-  const users = {
-    alice: { role: 'admin', registeredDevices: ['dev-001'], status: 'ACTIVE' },
-    bob: { role: 'viewer', registeredDevices: ['dev-002'], status: 'ACTIVE' },
+async function mockCreateUser(userId, role, devices, status) {
+  const allowed = ['admin', 'editor', 'viewer'];
+  const resolvedRole = allowed.includes(role) ? role : 'viewer';
+  const deviceList = Array.isArray(devices) ? devices.map(String) : [];
+  const resolvedStatus = status === 'SUSPENDED' || status === 'DELETED' ? status : 'ACTIVE';
+  const existing = testLedger.users.get(userId);
+  if (existing) {
+    const merged = Array.from(new Set([...(existing.registeredDevices || []), ...deviceList]));
+    const updated = {
+      ...existing,
+      role: resolvedRole,
+      registeredDevices: merged,
+      status: resolvedStatus,
+    };
+    testLedger.users.set(userId, updated);
+    return {
+      status: 'User updated',
+      userId,
+      role: updated.role,
+      registeredDevices: updated.registeredDevices,
+      accountStatus: updated.status,
+      txId: mockTxId(),
+    };
+  }
+  const user = {
+    userId,
+    role: resolvedRole,
+    registeredDevices: deviceList,
+    status: resolvedStatus,
   };
+  testLedger.users.set(userId, user);
+  return {
+    status: 'User created',
+    userId,
+    role: user.role,
+    registeredDevices: user.registeredDevices,
+    accountStatus: user.status,
+    txId: mockTxId(),
+  };
+}
+
+function mockRegisterDevice(userId, deviceId) {
+  const user = testLedger.users.get(userId);
+  if (!user) throw new Error(`User ${userId} not found`);
+  if (user.registeredDevices.includes(deviceId)) {
+    return { status: 'Device already registered', userId, deviceId, txId: mockTxId() };
+  }
+  user.registeredDevices.push(deviceId);
+  testLedger.users.set(userId, user);
+  return { status: 'Device registered', userId, deviceId, txId: mockTxId() };
+}
+
+function mockEvaluateAccess(userId, deviceId, riskScore, requiredPermission, options) {
   const roles = {
     admin: ['read', 'write', 'delete', 'manage'],
     viewer: ['read'],
     editor: ['read', 'write'],
   };
   const txId = mockTxId();
-  const user = users[userId];
+  const user = testLedger.users.get(userId);
   let decision = 'ALLOW';
   let reason = options.issueGrant === false ? 'Preflight checks passed' : 'All checks passed';
   if (!user) {
@@ -279,29 +332,57 @@ async function evaluateAccess(userId, deviceId, riskScore, requiredPermission, o
   if (isTestMode()) {
     return mockEvaluateAccess(userId, deviceId, riskScore, requiredPermission, options);
   }
-  const result = await submitJson(
-    'EvaluateAccess',
-    userId,
-    deviceId,
-    options.proofPackage ? '' : String(riskScore),
-    requiredPermission,
-    options.proofPackage ? JSON.stringify(options.proofPackage) : '',
-    options.modelVersion || '',
-    options.resource || 'default',
-    options.issueGrant === false ? 'false' : 'true'
-  );
-  logger.info({ txId: result.txId, userId, decision: result.decision, reason: result.reason }, 'Fabric blockchain decision');
+  try {
+    const result = await submitJson(
+      'EvaluateAccess',
+      userId,
+      deviceId,
+      options.proofPackage ? '' : String(riskScore),
+      requiredPermission,
+      options.proofPackage ? JSON.stringify(options.proofPackage) : '',
+      options.modelVersion || '',
+      options.resource || 'default',
+      options.issueGrant === false ? 'false' : 'true'
+    );
+    logger.info({ txId: result.txId, userId, decision: result.decision, reason: result.reason }, 'Fabric blockchain decision');
 
-  return {
-    decision: result.decision,
-    reason: result.reason,
-    txId: result.txId,
-    layer: 'Smart Contract (Hyperledger Fabric)',
-    policyId: result.policyId,
-    policyVersion: result.policyVersion,
-    modelVersion: result.modelVersion,
-    accessGrant: result.accessGrant,
-  };
+    return {
+      decision: result.decision,
+      reason: result.reason,
+      txId: result.txId,
+      layer: 'Smart Contract (Hyperledger Fabric)',
+      policyId: result.policyId,
+      policyVersion: result.policyVersion,
+      modelVersion: result.modelVersion,
+      accessGrant: result.accessGrant,
+    };
+  } catch (err) {
+    const mode = process.env.FABRIC_FAILURE_MODE || 'fail_closed';
+    logger.error({ err: err.message, userId, mode }, 'Fabric evaluateAccess failed');
+    if (mode === 'soft_deny_high_risk' && typeof riskScore === 'number') {
+      // Soft mode: allow only low-risk reads without ledger (never for write/delete/manage)
+      const perm = requiredPermission || 'read';
+      if (perm === 'read' && riskScore < 0.3) {
+        return {
+          decision: 'ALLOW',
+          reason: 'Fabric unavailable — soft mode low-risk read allow (no grant issued)',
+          txId: `soft-${Date.now()}`,
+          layer: 'Policy Engine (Fabric soft-fail)',
+          accessGrant: null,
+          degraded: true,
+        };
+      }
+    }
+    // Default fail-closed
+    return {
+      decision: 'DENY',
+      reason: 'Authorization service unavailable (fail-closed)',
+      txId: `failclosed-${Date.now()}`,
+      layer: 'Policy Engine (Fabric fail-closed)',
+      accessGrant: null,
+      degraded: true,
+    };
+  }
 }
 
 /**
@@ -478,6 +559,91 @@ async function verifyCredential(credentialId) {
   return evaluateJson('VerifyCredential', credentialId);
 }
 
+/**
+ * Create or upsert a user on the Fabric UserRegistry (dual-write with Postgres).
+ * @param {{ userId: string, role?: string, devices?: string[], status?: string }} opts
+ */
+async function createUser({ userId, role = 'viewer', devices = [], status = 'ACTIVE' } = {}) {
+  if (!userId) throw new Error('userId is required');
+  if (isTestMode()) {
+    return mockCreateUser(userId, role, devices, status);
+  }
+  const result = await submitJson(
+    'CreateUser',
+    userId,
+    role || 'viewer',
+    JSON.stringify(devices || []),
+    status || 'ACTIVE'
+  );
+  return { ...result, txId: result.txId || mockTxId() };
+}
+
+/**
+ * Register a device on Fabric. If the user is missing on-chain, create them first.
+ * @param {string} userId
+ * @param {string} deviceId
+ * @param {{ role?: string, ensureUser?: boolean }} [opts]
+ */
+async function registerDevice(userId, deviceId, opts = {}) {
+  if (!userId || !deviceId) throw new Error('userId and deviceId are required');
+  if (isTestMode()) {
+    try {
+      return mockRegisterDevice(userId, deviceId);
+    } catch (err) {
+      if (opts.ensureUser !== false && /not found/i.test(err.message)) {
+        mockCreateUser(userId, opts.role || 'viewer', [deviceId], 'ACTIVE');
+        return mockRegisterDevice(userId, deviceId);
+      }
+      throw err;
+    }
+  }
+  try {
+    const result = await submitJson('RegisterDevice', userId, deviceId);
+    return { ...result, txId: result.txId || mockTxId() };
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (opts.ensureUser !== false && /not found/i.test(msg)) {
+      await createUser({
+        userId,
+        role: opts.role || 'viewer',
+        devices: [deviceId],
+        status: 'ACTIVE',
+      });
+      const result = await submitJson('RegisterDevice', userId, deviceId);
+      return { ...result, txId: result.txId || mockTxId(), createdUser: true };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Update on-chain account status (ACTIVE / SUSPENDED).
+ */
+async function updateUserStatus(userId, status) {
+  if (isTestMode()) {
+    const user = testLedger.users.get(userId);
+    if (!user) throw new Error(`User ${userId} not found`);
+    user.status = status;
+    testLedger.users.set(userId, user);
+    return { status: 'User status updated', userId, newStatus: status, txId: mockTxId() };
+  }
+  return submitJson('UpdateUserStatus', userId, status);
+}
+
+/**
+ * Read on-chain user record (or null).
+ */
+async function getUser(userId) {
+  if (isTestMode()) {
+    return testLedger.users.get(userId) || null;
+  }
+  try {
+    return await evaluateJson('GetUser', userId);
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   evaluateAccess,
   getAuditLog,
@@ -491,5 +657,9 @@ module.exports = {
   resolveDID,
   issueVerifiableCredential,
   verifyCredential,
+  createUser,
+  registerDevice,
+  updateUserStatus,
+  getUser,
   closeGrpcClients,
 };

@@ -40,7 +40,9 @@ class MockStub {
     /** @type {string} */
     this._mspId = options.stubMspId || 'Org1MSP';
     /** @type {number} */
-    this._tsMs = options.timestampMs ?? Date.now();
+    // null sentinel → getDateTimestamp reads Date.now() at call time so
+    // jest.setSystemTime() propagates. Tests that pin time use setTimestampMs.
+    this._tsMs = options.timestampMs ?? null;
     this._txCounter = 0;
   }
 
@@ -77,8 +79,9 @@ class MockStub {
   }
 
   getDateTimestamp() {
-    const sec = Math.floor(this._tsMs / 1000);
-    return { seconds: { low: sec, high: 0, unsigned: false }, nanos: (this._tsMs % 1000) * 1e6 };
+    const ms = this._tsMs ?? Date.now();
+    const sec = Math.floor(ms / 1000);
+    return { seconds: { low: sec, high: 0, unsigned: false }, nanos: (ms % 1000) * 1e6 };
   }
 
   getTxTimestamp() {

@@ -47,6 +47,24 @@ describe('Policy-engine proxy', () => {
     expect(scope.isDone()).toBe(true);
   });
 
+  test('proxyToPolicyEngine promotes zt_access cookie to Authorization Bearer', async () => {
+    const base = 'http://127.0.0.1:40204';
+    const { app } = loadApp(base);
+
+    const scope = nock(base)
+      .matchHeader('authorization', /^Bearer cookie-jwt$/)
+      .get('/v1/me/devices')
+      .reply(200, { devices: [] });
+
+    const { cookie } = await csrfPair(app);
+    await request(app)
+      .get('/api/me/devices')
+      .set('Cookie', `${cookie}; zt_access=cookie-jwt`)
+      .expect(200);
+
+    expect(scope.isDone()).toBe(true);
+  });
+
   test('propagates downstream HTTP status codes for login', async () => {
     const base = 'http://127.0.0.1:40202';
     const { app } = loadApp(base);

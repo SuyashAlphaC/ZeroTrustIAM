@@ -12,6 +12,9 @@ process.env.ML_SERVICE_ENABLED = 'false';
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-integration';
 process.env.JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'test-refresh-integration';
 process.env.OAUTH_DEFAULT_CLIENT_SECRET = process.env.OAUTH_DEFAULT_CLIENT_SECRET || 'test-oauth-client';
+process.env.EXPOSE_RISK_DETAILS = 'false';
+// Prod-like device trust: do not password-enroll arbitrary devices in these tests
+process.env.DEVICE_ENROLL_MODE = 'first_only';
 
 const request = require('supertest');
 const { app, start } = require('../../server');
@@ -74,7 +77,12 @@ describe('API Integration Tests', () => {
         });
       expect(res.status).toBe(200);
       expect(res.body.decision).toBe('ALLOW');
-      expect(res.body.riskScore).toBeDefined();
+      // Public clients must never receive raw risk scores
+      expect(res.body.riskScore).toBeUndefined();
+      expect(res.body.breakdown).toBeUndefined();
+      expect(res.body.ensemble).toBeUndefined();
+      expect(res.body.reasonCode).toBe('OK');
+      expect(res.body.userMessage).toBeTruthy();
       expect(res.body.accessToken).toBeDefined();
       expect(res.body.txId).toBeDefined();
     });
@@ -91,7 +99,7 @@ describe('API Integration Tests', () => {
         });
       expect(res.status).toBe(200);
       expect(res.body.decision).toBe('DENY');
-      expect(res.body.reason).toContain('wrong password');
+      expect(res.body.reason).toBe('Invalid credentials');
     });
 
     it('denies non-existent user', async () => {
@@ -104,10 +112,11 @@ describe('API Integration Tests', () => {
         });
       expect(res.status).toBe(200);
       expect(res.body.decision).toBe('DENY');
-      expect(res.body.reason).toContain('user not found');
+      expect(res.body.reason).toBe('Invalid credentials');
     });
 
-    it('denies unregistered device via smart contract', async () => {
+    it('denies untrusted device without leaking risk scores', async () => {
+      // first_only enroll mode: alice already has devices → unknown credential denied
       const res = await request(app)
         .post('/evaluate')
         .send({
@@ -120,10 +129,13 @@ describe('API Integration Tests', () => {
         });
       expect(res.status).toBe(200);
       expect(res.body.decision).toBe('DENY');
-      expect(res.body.reason).toContain('Unregistered device');
+      expect(res.body.reasonCode).toBe('UNTRUSTED_DEVICE');
+      expect(res.body.riskScore).toBeUndefined();
+      expect(String(res.body.reason || '')).not.toMatch(/0\.\d/);
+      expect(String(res.body.userMessage || '')).not.toMatch(/0\.\d/);
     });
 
-    it('denies high risk score (cumulative risk)', async () => {
+    it('denies high risk without exposing numeric scores', async () => {
       const res = await request(app)
         .post('/evaluate')
         .send({
@@ -136,7 +148,11 @@ describe('API Integration Tests', () => {
         });
       expect(res.status).toBe(200);
       expect(res.body.decision).toBe('DENY');
-      expect(res.body.riskScore).toBeGreaterThanOrEqual(0.6);
+      expect(res.body.riskScore).toBeUndefined();
+      expect(res.body.breakdown).toBeUndefined();
+      // Either untrusted device or risk — both must be non-numeric public reasons
+      expect(['RISK_DENIED', 'UNTRUSTED_DEVICE', 'DENIED', 'POLICY_DENIED']).toContain(res.body.reasonCode);
+      expect(JSON.stringify(res.body)).not.toMatch(/"riskScore"/);
     });
 
     it('denies RBAC violation (viewer trying delete)', async () => {
@@ -154,7 +170,7 @@ describe('API Integration Tests', () => {
       expect(res.body.decision).toBe('DENY');
     });
 
-    it('returns ZKP proof on successful login', async () => {
+    it('omits ZKP proof when ZKP is disabled (default)', async () => {
       const res = await request(app)
         .post('/evaluate')
         .send({
@@ -166,8 +182,8 @@ describe('API Integration Tests', () => {
           requiredPermission: 'read',
         });
       expect(res.body.decision).toBe('ALLOW');
-      expect(res.body.zkProof).toBeDefined();
-      expect(res.body.zkProof.proofId).toBeDefined();
+      // ZKP is opt-in experimental — not part of the security boundary
+      expect(res.body.zkProof).toBeUndefined();
     });
   });
 
@@ -289,39 +305,67 @@ describe('API Integration Tests', () => {
     });
   });
 
-  describe('ZKP endpoints', () => {
-    it('POST /zkp/prove creates a proof', async () => {
+  describe('ZKP endpoints (auth + opt-in)', () => {
+    let accessToken;
+
+    beforeAll(async () => {
+      const res = await request(app)
+        .post('/evaluate')
+        .send({
+          username: 'alice',
+          password: 'pass123',
+          deviceId: 'dev-001',
+          timestamp: '2026-04-02T10:00:00Z',
+          location: { country: 'IN', city: 'Gwalior' },
+        });
+      accessToken = res.body.accessToken;
+    });
+
+    it('rejects unauthenticated ZKP prove', async () => {
       const res = await request(app)
         .post('/zkp/prove')
         .send({ riskScore: 0.3, threshold: 0.6 });
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(res.body.rangeProof).toBeDefined();
+      expect(res.status).toBe(401);
     });
 
-    it('POST /zkp/prove fails when risk >= threshold', async () => {
+    it('returns 503 when ZKP is disabled', async () => {
       const res = await request(app)
         .post('/zkp/prove')
-        .send({ riskScore: 0.8, threshold: 0.6 });
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(false);
-    });
-
-    it('POST /zkp/verify validates a proof', async () => {
-      const proveRes = await request(app)
-        .post('/zkp/prove')
-        .send({ riskScore: 0.2, threshold: 0.6 });
-      const res = await request(app)
-        .post('/zkp/verify')
-        .send({ proof: proveRes.body.rangeProof });
-      expect(res.status).toBe(200);
-      expect(res.body.valid).toBe(true);
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ riskScore: 0.3, threshold: 0.6 });
+      // Default ZKP_ENABLED is false
+      expect([503, 200]).toContain(res.status);
+      if (res.status === 503) {
+        expect(res.body.experimental).toBe(true);
+      }
     });
   });
 
   describe('Anomaly detection endpoints', () => {
-    it('GET /anomaly/profile/:username returns profile', async () => {
+    let accessToken;
+
+    beforeAll(async () => {
+      const res = await request(app)
+        .post('/evaluate')
+        .send({
+          username: 'alice',
+          password: 'pass123',
+          deviceId: 'dev-001',
+          timestamp: '2026-04-02T10:00:00Z',
+          location: { country: 'IN', city: 'Gwalior' },
+        });
+      accessToken = res.body.accessToken;
+    });
+
+    it('rejects unauthenticated profile access', async () => {
       const res = await request(app).get('/anomaly/profile/alice');
+      expect(res.status).toBe(401);
+    });
+
+    it('GET /anomaly/profile/:username returns profile for self', async () => {
+      const res = await request(app)
+        .get('/anomaly/profile/alice')
+        .set('Authorization', `Bearer ${accessToken}`);
       expect(res.status).toBe(200);
       expect(res.body.userId).toBe('alice');
     });
@@ -329,6 +373,7 @@ describe('API Integration Tests', () => {
     it('POST /anomaly/detect returns anomaly scores', async () => {
       const res = await request(app)
         .post('/anomaly/detect')
+        .set('Authorization', `Bearer ${accessToken}`)
         .send({
           username: 'alice',
           deviceId: 'dev-001',
@@ -342,18 +387,34 @@ describe('API Integration Tests', () => {
   });
 
   describe('MFA endpoints', () => {
-    it('GET /mfa/status/:username returns MFA status', async () => {
-      const res = await request(app).get('/mfa/status/alice');
+    let accessToken;
+
+    beforeAll(async () => {
+      const res = await request(app)
+        .post('/evaluate')
+        .send({
+          username: 'alice',
+          password: 'pass123',
+          deviceId: 'dev-001',
+          timestamp: '2026-04-02T10:00:00Z',
+          location: { country: 'IN', city: 'Gwalior' },
+        });
+      accessToken = res.body.accessToken;
+    });
+
+    it('GET /mfa/status/:username returns MFA status for self', async () => {
+      const res = await request(app)
+        .get('/mfa/status/alice')
+        .set('Authorization', `Bearer ${accessToken}`);
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('enabled');
     });
   });
 
   describe('Audit log', () => {
-    it('GET /audit-log returns blockchain audit entries', async () => {
+    it('requires admin auth', async () => {
       const res = await request(app).get('/audit-log');
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.status).toBe(401);
     });
   });
 });

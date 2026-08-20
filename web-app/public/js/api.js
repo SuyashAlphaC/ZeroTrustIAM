@@ -41,10 +41,32 @@ export async function api(path, opts = {}) {
 
   let data = null;
   const ct = res.headers.get('content-type') || '';
+
+  // Blob downloads must be read as binary first (even when Content-Type is application/json).
+  if (opts.expect === 'blob') {
+    if (!res.ok) {
+      // Prefer JSON error body when present
+      let errBody = null;
+      try {
+        const text = await res.text();
+        try { errBody = JSON.parse(text); } catch { errBody = { message: text }; }
+      } catch { /* ignore */ }
+      const err = new Error(errBody?.error || errBody?.message || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.data = errBody;
+      if (res.status === 401) {
+        clearSession();
+        if (!path.includes('/login') && !path.includes('/refresh')) {
+          location.href = '/?next=' + encodeURIComponent(location.pathname);
+        }
+      }
+      throw err;
+    }
+    return res.blob();
+  }
+
   if (ct.includes('application/json')) {
     try { data = await res.json(); } catch { data = null; }
-  } else if (opts.expect === 'blob') {
-    data = await res.blob();
   } else {
     data = await res.text();
   }
@@ -63,7 +85,8 @@ export async function api(path, opts = {}) {
   return data;
 }
 
-export const get  = (p, opts) => api(p, { ...opts, method: 'GET' });
-export const post = (p, body, opts) => api(p, { ...opts, method: 'POST', body });
-export const del  = (p, opts) => api(p, { ...opts, method: 'DELETE' });
-export const put  = (p, body, opts) => api(p, { ...opts, method: 'PUT', body });
+export const get   = (p, opts) => api(p, { ...opts, method: 'GET' });
+export const post  = (p, body, opts) => api(p, { ...opts, method: 'POST', body });
+export const del   = (p, opts = {}) => api(p, { ...opts, method: 'DELETE' });
+export const put   = (p, body, opts) => api(p, { ...opts, method: 'PUT', body });
+export const patch = (p, body, opts) => api(p, { ...opts, method: 'PATCH', body });

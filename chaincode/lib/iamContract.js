@@ -210,6 +210,18 @@ function verifyLinkProof(proof, expectedStatement, context) {
 class IAMContract extends Contract {
 
   /**
+   * Deterministic timestamp from the proposal — IDENTICAL on every endorsing
+   * peer, unlike `new Date()`. Required for AND endorsement: any state write
+   * derived from clock must use this or `ProposalResponsePayloads do not match`.
+   */
+  _txIso(ctx) {
+    const ts = ctx.stub.getTxTimestamp();
+    const seconds = Number(ts.seconds.low !== undefined ? ts.seconds.low : ts.seconds);
+    const nanos = Number(ts.nanos || 0);
+    return new Date(seconds * 1000 + Math.floor(nanos / 1e6)).toISOString();
+  }
+
+  /**
    * Initialize the ledger with seed data:
    * - User registry (alice, bob)
    * - Role-permission mappings
@@ -271,7 +283,7 @@ class IAMContract extends Contract {
         modelType: 'AHP+Anomaly+OptionalML',
         approvedBy: 'system',
         active: true,
-        createdAt: new Date().toISOString(),
+        createdAt: this._txIso(ctx),
       }))
     );
 
@@ -300,7 +312,7 @@ class IAMContract extends Contract {
   ) {
     const riskScore = parseFloat(riskScoreStr);
     const txId = ctx.stub.getTxID();
-    const timestamp = new Date().toISOString();
+    const timestamp = this._txIso(ctx);
     const params = await this._getPolicyPublicParams(ctx);
     const proofPackage = this._parseOptionalJson(proofPackageJson);
     const activeModelVersion = modelVersion || params.activeModelVersion;
@@ -627,6 +639,82 @@ class IAMContract extends Contract {
   }
 
   /**
+   * Create (or upsert) a user in the on-chain registry.
+   * Called by the policy-engine when an admin / SCIM / federation provisions a user
+   * so EvaluateAccess can enforce device + RBAC rules for non-seed accounts.
+   *
+   * @param {string} userId
+   * @param {string} role - admin | editor | viewer
+   * @param {string} devicesJson - JSON array of device id strings
+   * @param {string} [status] - ACTIVE | SUSPENDED (default ACTIVE)
+   */
+  async CreateUser(ctx, userId, role, devicesJson, status) {
+    if (!userId || typeof userId !== 'string' || userId.length < 2 || userId.length > 80) {
+      throw new Error('Invalid userId');
+    }
+    const allowedRoles = ['admin', 'editor', 'viewer'];
+    const resolvedRole = allowedRoles.includes(role) ? role : 'viewer';
+    let devices = [];
+    if (devicesJson) {
+      try {
+        const parsed = JSON.parse(devicesJson);
+        if (Array.isArray(parsed)) {
+          devices = parsed.map(String).filter((d) => d && d.length <= 100);
+        }
+      } catch {
+        throw new Error('devicesJson must be a JSON array of device ids');
+      }
+    }
+    const resolvedStatus = (status === 'SUSPENDED' || status === 'DELETED') ? status : 'ACTIVE';
+
+    const existingBytes = await ctx.stub.getState(`UserRegistry:${userId}`);
+    if (existingBytes && existingBytes.length > 0) {
+      const existing = JSON.parse(existingBytes.toString());
+      const merged = Array.from(new Set([
+        ...(existing.registeredDevices || []),
+        ...devices,
+      ]));
+      const updated = {
+        ...existing,
+        role: resolvedRole,
+        registeredDevices: merged,
+        status: resolvedStatus,
+        updatedAt: this._txIso(ctx),
+      };
+      await ctx.stub.putState(
+        `UserRegistry:${userId}`,
+        Buffer.from(JSON.stringify(updated))
+      );
+      return JSON.stringify({
+        status: 'User updated',
+        userId,
+        role: updated.role,
+        registeredDevices: updated.registeredDevices,
+        accountStatus: updated.status,
+      });
+    }
+
+    const user = {
+      userId,
+      role: resolvedRole,
+      registeredDevices: devices,
+      status: resolvedStatus,
+      createdAt: this._txIso(ctx),
+    };
+    await ctx.stub.putState(
+      `UserRegistry:${userId}`,
+      Buffer.from(JSON.stringify(user))
+    );
+    return JSON.stringify({
+      status: 'User created',
+      userId,
+      role: user.role,
+      registeredDevices: user.registeredDevices,
+      accountStatus: user.status,
+    });
+  }
+
+  /**
    * Register a new device for a user.
    */
   async RegisterDevice(ctx, userId, newDeviceId) {
@@ -787,7 +875,7 @@ class IAMContract extends Contract {
       date,
       merkleRoot,
       txId: ctx.stub.getTxID(),
-      anchoredAt: new Date().toISOString(),
+      anchoredAt: this._txIso(ctx),
       anchoredBy: mspId,
     };
     await ctx.stub.putState(`AuditDailyRoot:${date}`, Buffer.from(JSON.stringify(record)));
@@ -870,7 +958,7 @@ class IAMContract extends Contract {
     const next = {
       ...current,
       ...updates,
-      updatedAt: new Date().toISOString(),
+      updatedAt: this._txIso(ctx),
       updateTxId: ctx.stub.getTxID(),
     };
 
@@ -901,7 +989,7 @@ class IAMContract extends Contract {
       modelType: modelType || 'unknown',
       approvedBy: approvedBy || 'unknown',
       active: activate,
-      createdAt: new Date().toISOString(),
+      createdAt: this._txIso(ctx),
       txId: ctx.stub.getTxID(),
     };
 
@@ -964,7 +1052,7 @@ class IAMContract extends Contract {
 
     const grant = JSON.parse(grantBytes.toString());
     grant.revoked = true;
-    grant.revokedAt = new Date().toISOString();
+    grant.revokedAt = this._txIso(ctx);
     grant.revokedByTxId = ctx.stub.getTxID();
     grant.revocationReason = reason || 'revoked';
 
@@ -985,7 +1073,7 @@ class IAMContract extends Contract {
   async CreateDID(ctx, userId, publicKeyJwkJson, authenticationMethod) {
     const did = `did:fabric:iam:${userId}`;
     const txId = ctx.stub.getTxID();
-    const timestamp = new Date().toISOString();
+    const timestamp = this._txIso(ctx);
 
     // Check if DID already exists
     const existingBytes = await ctx.stub.getState(`DID:${did}`);
@@ -1060,7 +1148,7 @@ class IAMContract extends Contract {
       '@context': 'https://w3id.org/did-resolution/v1',
       didResolutionMetadata: {
         contentType: 'application/did+json',
-        retrieved: new Date().toISOString(),
+        retrieved: this._txIso(ctx),
       },
       didDocument,
       didDocumentMetadata: {
@@ -1082,7 +1170,7 @@ class IAMContract extends Contract {
 
     const didDocument = JSON.parse(didBytes.toString());
     const newPublicKeyJwk = JSON.parse(newPublicKeyJwkJson);
-    const timestamp = new Date().toISOString();
+    const timestamp = this._txIso(ctx);
 
     // Add new key and rotate
     const keyIndex = didDocument.verificationMethod.length + 1;
@@ -1122,7 +1210,7 @@ class IAMContract extends Contract {
     didDocument.authentication = [];
     didDocument.assertionMethod = [];
     didDocument.deactivated = true;
-    didDocument.updated = new Date().toISOString();
+    didDocument.updated = this._txIso(ctx);
     didDocument.txId = ctx.stub.getTxID();
 
     await ctx.stub.putState(
@@ -1138,7 +1226,7 @@ class IAMContract extends Contract {
    */
   async IssueVerifiableCredential(ctx, credentialId, issuerDid, subjectDid, credentialTypeJson, claimsJson) {
     const txId = ctx.stub.getTxID();
-    const timestamp = new Date().toISOString();
+    const timestamp = this._txIso(ctx);
 
     const credential = {
       '@context': [

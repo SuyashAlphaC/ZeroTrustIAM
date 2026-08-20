@@ -291,6 +291,165 @@ const MIGRATIONS = [{
     await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS family_id');
     await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS status');
   },
+}, {
+  id: '007_lockout_abac_selfservice',
+  /** Account lockout counters, ABAC policies, password-reset tokens, session ids. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS account_lockouts (
+        user_id TEXT PRIMARY KEY,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        window_started_at TIMESTAMPTZ,
+        locked_until TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS abac_policies (
+        policy_id TEXT PRIMARY KEY,
+        policy_json JSONB NOT NULL,
+        active SMALLINT NOT NULL DEFAULT 1,
+        description TEXT,
+        created_by TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used SMALLINT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_tokens(user_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_abac_active ON abac_policies(active)');
+    // Stable session id for self-service revoke without exposing raw refresh tokens
+    await client.query('ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS session_id UUID DEFAULT gen_random_uuid()');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_refresh_session ON refresh_tokens(session_id)');
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP INDEX IF EXISTS idx_refresh_session');
+    await client.query('ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS session_id');
+    await client.query('DROP TABLE IF EXISTS password_reset_tokens CASCADE');
+    await client.query('DROP TABLE IF EXISTS abac_policies CASCADE');
+    await client.query('DROP TABLE IF EXISTS account_lockouts CASCADE');
+  },
+}, {
+  id: '008_multitenancy_federation',
+  /** Tenants, billing/CMK metadata, federated identities, tenant_id on users. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenants (
+        tenant_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        plan TEXT NOT NULL DEFAULT 'free',
+        billing_email TEXT,
+        cmk_arn TEXT,
+        cmk_key_id TEXT,
+        settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      INSERT INTO tenants (tenant_id, name, slug, plan, status)
+      VALUES ('default', 'Default Organization', 'default', 'enterprise', 'ACTIVE')
+      ON CONFLICT (tenant_id) DO NOTHING
+    `);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id TEXT DEFAULT 'default'`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS federated_identities (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        email TEXT,
+        claims JSONB,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(provider, subject)
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_fed_user ON federated_identities(user_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_fed_tenant ON federated_identities(tenant_id)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenant_billing_events (
+        id SERIAL PRIMARY KEY,
+        tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        amount_cents INTEGER,
+        currency TEXT DEFAULT 'USD',
+        metadata JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP TABLE IF EXISTS tenant_billing_events CASCADE');
+    await client.query('DROP TABLE IF EXISTS federated_identities CASCADE');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS email');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS tenant_id');
+    await client.query('DROP TABLE IF EXISTS tenants CASCADE');
+  },
+}, {
+  id: '009_stripe_billing',
+  /** Stripe customer/subscription fields on tenants + richer billing events. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT');
+    await client.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT');
+    await client.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_status TEXT');
+    await client.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_period_end TIMESTAMPTZ');
+    await client.query('ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancel_at_period_end SMALLINT NOT NULL DEFAULT 0');
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_stripe_customer ON tenants(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_billing_events_tenant ON tenant_billing_events(tenant_id, created_at DESC)');
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP INDEX IF EXISTS idx_billing_events_tenant');
+    await client.query('DROP INDEX IF EXISTS idx_tenants_stripe_customer');
+    await client.query('ALTER TABLE tenants DROP COLUMN IF EXISTS cancel_at_period_end');
+    await client.query('ALTER TABLE tenants DROP COLUMN IF EXISTS subscription_period_end');
+    await client.query('ALTER TABLE tenants DROP COLUMN IF EXISTS subscription_status');
+    await client.query('ALTER TABLE tenants DROP COLUMN IF EXISTS stripe_subscription_id');
+    await client.query('ALTER TABLE tenants DROP COLUMN IF EXISTS stripe_customer_id');
+  },
+}, {
+  id: '010_user_phone_notifications',
+  /** Phone on users + notification outbox for admin lifecycle events. */
+  /** @param {import('pg').PoolClient} client */
+  up: async (client) => {
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notification_outbox (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT,
+        event TEXT NOT NULL,
+        actor TEXT,
+        subject TEXT,
+        channels JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_notify_outbox_user ON notification_outbox(user_id, created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_notify_outbox_event ON notification_outbox(event, created_at DESC)');
+  },
+  /** @param {import('pg').PoolClient} client */
+  down: async (client) => {
+    await client.query('DROP TABLE IF EXISTS notification_outbox CASCADE');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS phone');
+  },
 }];
 
 async function init() {
@@ -338,6 +497,9 @@ async function getUser(userId) {
     normalHours: [row.normal_hours_start, row.normal_hours_end],
     status: row.status,
     did: row.did,
+    tenantId: row.tenant_id || 'default',
+    email: row.email || null,
+    phone: row.phone || null,
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
   };
 }
@@ -345,10 +507,28 @@ async function getUser(userId) {
 async function createUser({ userId, password, role, usualCountry, usualCity, normalHoursStart, normalHoursEnd, devices }) {
   const config = require('./config');
   const passwordHash = bcrypt.hashSync(password, config.bcryptRounds);
+  await createUserWithHash({
+    userId,
+    passwordHash,
+    role,
+    usualCountry,
+    usualCity,
+    normalHoursStart,
+    normalHoursEnd,
+    devices,
+  });
+}
+
+async function createUserWithHash({ userId, passwordHash, role, usualCountry, usualCity, normalHoursStart, normalHoursEnd, devices, tenantId, email, phone }) {
   await pool.query(`
-    INSERT INTO users (user_id, password_hash, role, usual_country, usual_city, normal_hours_start, normal_hours_end, status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE')
-  `, [userId, passwordHash, role || 'viewer', usualCountry || 'UNKNOWN', usualCity || 'UNKNOWN', normalHoursStart || 9, normalHoursEnd || 17]);
+    INSERT INTO users (user_id, password_hash, role, usual_country, usual_city, normal_hours_start, normal_hours_end, status, tenant_id, email, phone)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',$8,$9,$10)
+  `, [
+    userId, passwordHash, role || 'viewer',
+    usualCountry || 'UNKNOWN', usualCity || 'UNKNOWN',
+    normalHoursStart || 9, normalHoursEnd || 17,
+    tenantId || 'default', email || null, phone || null,
+  ]);
   if (devices?.length > 0) {
     for (const deviceId of devices) {
       await pool.query(
@@ -359,6 +539,410 @@ async function createUser({ userId, password, role, usualCountry, usualCity, nor
   }
 }
 
+async function updateUserContact(userId, { email, phone } = {}) {
+  const sets = [];
+  const vals = [];
+  let i = 1;
+  if (email !== undefined) { sets.push(`email = $${i++}`); vals.push(email || null); }
+  if (phone !== undefined) { sets.push(`phone = $${i++}`); vals.push(phone || null); }
+  if (!sets.length) return;
+  vals.push(userId);
+  await pool.query(
+    `UPDATE users SET ${sets.join(', ')}, updated_at = NOW() WHERE user_id = $${i}`,
+    vals
+  );
+}
+
+async function recordNotification({ userId, event, channels, actor, subject }) {
+  await pool.query(
+    `INSERT INTO notification_outbox (user_id, event, actor, subject, channels)
+     VALUES ($1, $2, $3, $4, $5::jsonb)`,
+    [userId || null, event, actor || null, subject || null, JSON.stringify(channels || [])]
+  );
+}
+
+async function listNotifications({ userId, limit = 50 } = {}) {
+  const lim = Math.min(parseInt(limit, 10) || 50, 200);
+  if (userId) {
+    const { rows } = await pool.query(
+      `SELECT id, user_id, event, actor, subject, channels, created_at
+       FROM notification_outbox WHERE user_id = $1
+       ORDER BY created_at DESC LIMIT $2`,
+      [userId, lim]
+    );
+    return rows;
+  }
+  const { rows } = await pool.query(
+    `SELECT id, user_id, event, actor, subject, channels, created_at
+     FROM notification_outbox ORDER BY created_at DESC LIMIT $1`,
+    [lim]
+  );
+  return rows;
+}
+
+/** Hard-delete a just-provisioned user (compensating transaction after Fabric failure). */
+async function rollbackNewUser(userId) {
+  await pool.query('DELETE FROM devices WHERE user_id = $1', [userId]);
+  await pool.query('DELETE FROM users WHERE user_id = $1', [userId]);
+}
+
+async function updateUserPassword(userId, passwordHash) {
+  await pool.query(
+    'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE user_id = $2',
+    [passwordHash, userId]
+  );
+}
+
+async function setUserStatus(userId, status) {
+  await pool.query(
+    'UPDATE users SET status = $1, updated_at = NOW() WHERE user_id = $2',
+    [status, userId]
+  );
+}
+
+async function deleteUserDevice(userId, deviceId) {
+  const r = await pool.query(
+    'DELETE FROM devices WHERE user_id = $1 AND device_id = $2',
+    [userId, deviceId]
+  );
+  return (r.rowCount || 0) > 0;
+}
+
+async function listUserSessions(userId) {
+  const { rows } = await pool.query(
+    `SELECT session_id, family_id, status, issued_at, expires_at
+     FROM refresh_tokens
+     WHERE user_id = $1 AND status = 'ACTIVE' AND expires_at > NOW()
+     ORDER BY issued_at DESC
+     LIMIT 100`,
+    [userId]
+  );
+  return rows;
+}
+
+async function revokeUserSession(userId, sessionId) {
+  const r = await pool.query(
+    `UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1
+     WHERE user_id = $1 AND session_id::text = $2 AND status = 'ACTIVE'`,
+    [userId, sessionId]
+  );
+  return (r.rowCount || 0) > 0;
+}
+
+async function revokeOtherUserSessions(userId, keepRefreshToken) {
+  if (keepRefreshToken) {
+    const r = await pool.query(
+      `UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1
+       WHERE user_id = $1 AND token <> $2 AND status = 'ACTIVE'`,
+      [userId, keepRefreshToken]
+    );
+    return r.rowCount || 0;
+  }
+  const r = await pool.query(
+    `UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1
+     WHERE user_id = $1 AND status = 'ACTIVE'`,
+    [userId]
+  );
+  return r.rowCount || 0;
+}
+
+/** GDPR Art. 17 — erase PII from operational stores; leave hashed tombstones in audit. */
+async function eraseUserAccount(userId, redactionId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Redact audit rows (keep decision metadata for fraud prevention)
+    await client.query(
+      `UPDATE local_audit_log SET
+         device_id = CASE WHEN device_id IS NOT NULL THEN 'redacted' ELSE NULL END,
+         metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('redacted', true, 'redactionId', $1::text)
+       WHERE user_id = $2`,
+      [redactionId, userId]
+    );
+    await client.query(
+      `UPDATE login_history SET device_id = 'redacted', country = NULL, city = NULL WHERE user_id = $1`,
+      [userId]
+    );
+    await client.query('DELETE FROM webauthn_credentials WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM webauthn_challenges WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM mfa_secrets WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM mfa_challenges WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM devices WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM anomaly_profiles WHERE user_id = $1', [userId]);
+    await client.query(
+      "UPDATE refresh_tokens SET status = 'REVOKED', revoked = 1 WHERE user_id = $1",
+      [userId]
+    );
+    await client.query('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM account_lockouts WHERE user_id = $1', [userId]);
+    // Soft-delete: keep PK for historical FKs, wipe credentials and PII
+    await client.query(
+      `UPDATE users SET
+         password_hash = $1,
+         status = 'DELETED',
+         usual_country = 'XX',
+         usual_city = 'REDACTED',
+         did = NULL,
+         role = 'viewer',
+         updated_at = NOW()
+       WHERE user_id = $2`,
+      [`REDACTED:${redactionId}`, userId]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ── Account lockout (Postgres fallback when Redis unavailable) ──
+
+async function getAccountLockout(userId) {
+  const { rows: [row] } = await pool.query(
+    'SELECT * FROM account_lockouts WHERE user_id = $1',
+    [userId]
+  );
+  return row || null;
+}
+
+async function incrementLoginFailures(userId, windowSeconds) {
+  const { rows: [row] } = await pool.query(
+    'SELECT * FROM account_lockouts WHERE user_id = $1',
+    [userId]
+  );
+  const now = Date.now();
+  if (!row || !row.window_started_at
+      || (now - new Date(row.window_started_at).getTime()) > windowSeconds * 1000) {
+    await pool.query(`
+      INSERT INTO account_lockouts (user_id, failure_count, window_started_at, updated_at)
+      VALUES ($1, 1, NOW(), NOW())
+      ON CONFLICT (user_id) DO UPDATE SET
+        failure_count = 1, window_started_at = NOW(), locked_until = NULL, updated_at = NOW()
+    `, [userId]);
+    return 1;
+  }
+  const { rows: [updated] } = await pool.query(`
+    UPDATE account_lockouts SET failure_count = failure_count + 1, updated_at = NOW()
+    WHERE user_id = $1 RETURNING failure_count
+  `, [userId]);
+  return updated.failure_count;
+}
+
+async function setAccountLockout(userId, lockedUntilIso, failureCount) {
+  await pool.query(`
+    INSERT INTO account_lockouts (user_id, failure_count, locked_until, window_started_at, updated_at)
+    VALUES ($1, $2, $3, NOW(), NOW())
+    ON CONFLICT (user_id) DO UPDATE SET
+      failure_count = $2, locked_until = $3, updated_at = NOW()
+  `, [userId, failureCount || 0, lockedUntilIso]);
+}
+
+async function clearAccountLockout(userId) {
+  await pool.query('DELETE FROM account_lockouts WHERE user_id = $1', [userId]);
+}
+
+// ── ABAC policies ──
+
+async function listAbacPolicies({ activeOnly } = {}) {
+  const sql = activeOnly
+    ? 'SELECT * FROM abac_policies WHERE active = 1 ORDER BY created_at ASC'
+    : 'SELECT * FROM abac_policies ORDER BY created_at ASC';
+  return (await pool.query(sql)).rows;
+}
+
+async function upsertAbacPolicy(policyId, policyJson, description, createdBy) {
+  await pool.query(`
+    INSERT INTO abac_policies (policy_id, policy_json, description, created_by, active, updated_at)
+    VALUES ($1, $2::jsonb, $3, $4, 1, NOW())
+    ON CONFLICT (policy_id) DO UPDATE SET
+      policy_json = EXCLUDED.policy_json,
+      description = EXCLUDED.description,
+      active = 1,
+      updated_at = NOW()
+  `, [policyId, JSON.stringify(policyJson), description || null, createdBy || null]);
+}
+
+async function deleteAbacPolicy(policyId) {
+  const r = await pool.query('DELETE FROM abac_policies WHERE policy_id = $1', [policyId]);
+  return (r.rowCount || 0) > 0;
+}
+
+// ── Password reset tokens ──
+
+async function storePasswordResetToken(tokenHash, userId, expiresAt) {
+  await pool.query(
+    `INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+    [tokenHash, userId, expiresAt]
+  );
+}
+
+async function consumePasswordResetToken(tokenHash) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [row] } = await client.query(
+      'SELECT * FROM password_reset_tokens WHERE token_hash = $1 AND used = 0 AND expires_at > NOW()',
+      [tokenHash]
+    );
+    if (!row) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    await client.query('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = $1', [tokenHash]);
+    await client.query('COMMIT');
+    return row;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ── Multi-tenancy ──
+
+async function getTenant(tenantId) {
+  const { rows: [row] } = await pool.query('SELECT * FROM tenants WHERE tenant_id = $1', [tenantId]);
+  return row || null;
+}
+
+async function createTenant({ tenantId, name, slug, plan, billingEmail, cmkArn, settings }) {
+  await pool.query(`
+    INSERT INTO tenants (tenant_id, name, slug, plan, billing_email, cmk_arn, cmk_key_id, settings)
+    VALUES ($1,$2,$3,$4,$5,$6,$6,$7::jsonb)
+  `, [
+    tenantId, name, slug, plan || 'free', billingEmail || null, cmkArn || null,
+    JSON.stringify(settings || {}),
+  ]);
+}
+
+async function listTenants() {
+  return (await pool.query('SELECT * FROM tenants ORDER BY created_at ASC')).rows;
+}
+
+async function updateTenant(tenantId, patch) {
+  const fields = [];
+  const vals = [];
+  let i = 1;
+  for (const [k, col] of [
+    ['name', 'name'], ['slug', 'slug'], ['plan', 'plan'], ['status', 'status'],
+    ['billingEmail', 'billing_email'], ['cmkArn', 'cmk_arn'], ['cmkKeyId', 'cmk_key_id'],
+  ]) {
+    if (patch[k] !== undefined) {
+      fields.push(`${col} = $${i++}`);
+      vals.push(patch[k]);
+    }
+  }
+  if (patch.settings !== undefined) {
+    fields.push(`settings = $${i++}::jsonb`);
+    vals.push(JSON.stringify(patch.settings));
+  }
+  if (!fields.length) return getTenant(tenantId);
+  fields.push('updated_at = NOW()');
+  vals.push(tenantId);
+  await pool.query(`UPDATE tenants SET ${fields.join(', ')} WHERE tenant_id = $${i}`, vals);
+  return getTenant(tenantId);
+}
+
+async function linkFederatedIdentity({ userId, provider, subject, email, claims, tenantId }) {
+  await pool.query(`
+    INSERT INTO federated_identities (user_id, provider, subject, email, claims, tenant_id)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6)
+    ON CONFLICT (provider, subject) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      email = EXCLUDED.email,
+      claims = EXCLUDED.claims,
+      tenant_id = EXCLUDED.tenant_id,
+      linked_at = NOW()
+  `, [userId, provider, subject, email || null, JSON.stringify(claims || {}), tenantId || 'default']);
+}
+
+async function getFederatedIdentity(provider, subject) {
+  const { rows: [row] } = await pool.query(
+    'SELECT * FROM federated_identities WHERE provider = $1 AND subject = $2',
+    [provider, subject]
+  );
+  return row || null;
+}
+
+async function listUsersByTenant(tenantId) {
+  const { rows } = await pool.query(
+    'SELECT user_id, role, status, email, tenant_id, did, created_at FROM users WHERE tenant_id = $1',
+    [tenantId]
+  );
+  return rows;
+}
+
+async function recordBillingEvent(tenantId, eventType, amountCents, metadata) {
+  await pool.query(
+    `INSERT INTO tenant_billing_events (tenant_id, event_type, amount_cents, metadata)
+     VALUES ($1,$2,$3,$4::jsonb)`,
+    [tenantId, eventType, amountCents ?? null, JSON.stringify(metadata || {})]
+  );
+}
+
+async function listBillingEvents(tenantId, limit = 20) {
+  const { rows } = await pool.query(
+    `SELECT * FROM tenant_billing_events WHERE tenant_id = $1
+     ORDER BY created_at DESC LIMIT $2`,
+    [tenantId, limit]
+  );
+  return rows;
+}
+
+async function setTenantStripeCustomer(tenantId, customerId) {
+  await pool.query(
+    `UPDATE tenants SET stripe_customer_id = $1, updated_at = NOW() WHERE tenant_id = $2`,
+    [customerId, tenantId]
+  );
+}
+
+async function setTenantSubscription(tenantId, {
+  stripeSubscriptionId,
+  plan,
+  status,
+  periodEnd,
+  cancelAtPeriodEnd,
+} = {}) {
+  const sets = ['updated_at = NOW()'];
+  const vals = [];
+  let i = 1;
+  if (stripeSubscriptionId !== undefined) {
+    sets.push(`stripe_subscription_id = $${i++}`);
+    vals.push(stripeSubscriptionId);
+  }
+  if (plan !== undefined) {
+    sets.push(`plan = $${i++}`);
+    vals.push(plan);
+  }
+  if (status !== undefined) {
+    sets.push(`subscription_status = $${i++}`);
+    vals.push(status);
+  }
+  if (periodEnd !== undefined) {
+    sets.push(`subscription_period_end = $${i++}`);
+    vals.push(periodEnd);
+  }
+  if (cancelAtPeriodEnd !== undefined) {
+    sets.push(`cancel_at_period_end = $${i++}`);
+    vals.push(cancelAtPeriodEnd ? 1 : 0);
+  }
+  vals.push(tenantId);
+  await pool.query(`UPDATE tenants SET ${sets.join(', ')} WHERE tenant_id = $${i}`, vals);
+}
+
+async function findTenantByStripeCustomer(customerId) {
+  if (!customerId) return null;
+  const { rows: [row] } = await pool.query(
+    'SELECT * FROM tenants WHERE stripe_customer_id = $1',
+    [customerId]
+  );
+  return row || null;
+}
+
 async function getAllUsers() {
   const { rows } = await pool.query('SELECT user_id, role, status, did, created_at FROM users');
   return rows.map((row) => ({
@@ -367,15 +951,95 @@ async function getAllUsers() {
   }));
 }
 
+/**
+ * Admin directory: users with device/session counts and last login (no password hashes).
+ * Risk scores are omitted from the public admin list (use audit for investigations).
+ */
+async function getAdminUserDirectory() {
+  const { rows } = await pool.query(`
+    SELECT
+      u.user_id AS username,
+      u.user_id AS "userId",
+      u.role,
+      u.status,
+      u.email,
+      u.phone,
+      u.usual_country AS "usualCountry",
+      u.usual_city AS "usualCity",
+      u.created_at,
+      (SELECT COUNT(*)::int FROM devices d WHERE d.user_id = u.user_id) AS "deviceCount",
+      (SELECT COUNT(*)::int FROM refresh_tokens r
+        WHERE r.user_id = u.user_id AND r.status = 'ACTIVE' AND r.expires_at > NOW()) AS "activeSessions",
+      (SELECT EXISTS(SELECT 1 FROM mfa_secrets m WHERE m.user_id = u.user_id AND m.enabled = 1)) AS "mfaEnabled",
+      lh.timestamp AS "lastLoginAt",
+      lh.country AS "lastLoginCountry",
+      lh.city AS "lastLoginCity",
+      lh.decision AS "lastLoginDecision"
+    FROM users u
+    LEFT JOIN LATERAL (
+      SELECT timestamp, country, city, decision
+      FROM login_history
+      WHERE user_id = u.user_id
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ) lh ON TRUE
+    ORDER BY u.created_at DESC NULLS LAST, u.user_id ASC
+  `);
+  return rows.map((row) => ({
+    ...row,
+    created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+    lastLoginAt: row.lastLoginAt instanceof Date ? row.lastLoginAt.toISOString() : row.lastLoginAt,
+    mfaEnabled: !!row.mfaEnabled,
+  }));
+}
+
+async function getAdminOverview() {
+  const { rows: [counts] } = await pool.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM users WHERE status = 'ACTIVE') AS "activeUsers",
+      (SELECT COUNT(*)::int FROM users WHERE status = 'SUSPENDED') AS "suspendedUsers",
+      (SELECT COUNT(*)::int FROM users WHERE status = 'DELETED') AS "deletedUsers",
+      (SELECT COUNT(*)::int FROM users) AS "totalUsers",
+      (SELECT COUNT(*)::int FROM devices) AS "totalDevices",
+      (SELECT COUNT(*)::int FROM refresh_tokens WHERE status = 'ACTIVE' AND expires_at > NOW()) AS "activeSessions",
+      (SELECT COUNT(*)::int FROM local_audit_log WHERE created_at > NOW() - INTERVAL '24 hours') AS "auditLast24h"
+  `);
+  return counts || {};
+}
+
 async function registerDevice(userId, deviceId, label) {
   await pool.query(
-    'INSERT INTO devices (user_id, device_id, label) VALUES ($1, $2, $3) ON CONFLICT (user_id, device_id) DO NOTHING',
+    `INSERT INTO devices (user_id, device_id, label) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, device_id) DO UPDATE SET
+       label = COALESCE(EXCLUDED.label, devices.label)`,
     [userId, deviceId, label ?? null]
   );
 }
 
 async function getUserDevices(userId) {
-  const { rows } = await pool.query('SELECT device_id, label, registered_at FROM devices WHERE user_id = $1', [userId]);
+  const { rows } = await pool.query(
+    `
+    SELECT
+      d.device_id,
+      d.label,
+      d.registered_at,
+      lh.timestamp AS last_seen_at,
+      lh.country AS last_country,
+      lh.city AS last_city,
+      lh.decision AS last_decision
+    FROM devices d
+    LEFT JOIN LATERAL (
+      SELECT timestamp, country, city, decision
+      FROM login_history h
+      WHERE h.user_id = d.user_id AND h.device_id = d.device_id
+      ORDER BY h.timestamp DESC
+      LIMIT 1
+    ) lh ON TRUE
+    WHERE d.user_id = $1
+    ORDER BY COALESCE(lh.timestamp, d.registered_at) DESC NULLS LAST
+    `,
+    [userId]
+  );
   return rows;
 }
 
@@ -464,6 +1128,12 @@ async function getMFASecret(userId) {
   const { rows: [row] } = await pool.query('SELECT * FROM mfa_secrets WHERE user_id = $1', [userId]);
   if (!row) return null;
   return { ...row, secret: decryptSecret(row.secret) };
+}
+
+async function deleteMFASecret(userId) {
+  const r = await pool.query('DELETE FROM mfa_secrets WHERE user_id = $1', [userId]);
+  await pool.query('DELETE FROM mfa_challenges WHERE user_id = $1', [userId]).catch(() => {});
+  return (r.rowCount || 0) > 0;
 }
 
 async function storeMFAChallenge(challengeId, userId, context, expiresAt) {
@@ -621,6 +1291,47 @@ async function getLoginHistory(userId, limit) {
   const { rows } = await pool.query(
     'SELECT * FROM login_history WHERE user_id = $1 ORDER BY timestamp DESC LIMIT $2',
     [userId, limit || 100]
+  );
+  return rows;
+}
+
+/**
+ * User-facing access decision history: audit rows (have reason + real created_at)
+ * enriched with geo from nearby login_history when available.
+ */
+async function getUserAccessHistory(userId, limit = 25) {
+  const lim = Math.min(parseInt(limit, 10) || 25, 200);
+  const { rows } = await pool.query(
+    `
+    SELECT
+      a.created_at AS timestamp,
+      a.decision,
+      a.reason,
+      a.layer,
+      a.device_id,
+      a.tx_id,
+      lh.country,
+      lh.city
+    FROM local_audit_log a
+    LEFT JOIN LATERAL (
+      SELECT country, city
+      FROM login_history h
+      WHERE h.user_id = a.user_id
+        AND (
+          h.device_id IS NOT DISTINCT FROM a.device_id
+          OR a.device_id IS NULL
+          OR h.device_id IS NULL
+        )
+        AND abs(EXTRACT(EPOCH FROM (h.timestamp - a.created_at))) < 120
+      ORDER BY abs(EXTRACT(EPOCH FROM (h.timestamp - a.created_at))) ASC
+      LIMIT 1
+    ) lh ON TRUE
+    WHERE a.user_id = $1
+      AND a.decision IN ('ALLOW', 'DENY', 'MFA_REQUIRED', 'STEP_UP')
+    ORDER BY a.created_at DESC
+    LIMIT $2
+    `,
+    [userId, lim]
   );
   return rows;
 }
@@ -880,7 +1591,6 @@ async function seedOAuthClient() {
 async function seedDemoData() {
   const configLocal = require('./config');
   if (!configLocal.seedDemo) return false;
-  if (configLocal.nodeEnv === 'production') return false;
 
   const existing = await getUser('alice');
   if (existing) return false;
@@ -1064,9 +1774,32 @@ module.exports = {
   truncateTestData,
   getUser,
   createUser,
+  createUserWithHash,
+  rollbackNewUser,
+  updateUserPassword,
+  setUserStatus,
+  updateUserContact,
   getAllUsers,
+  getAdminUserDirectory,
+  getAdminOverview,
+  recordNotification,
+  listNotifications,
   registerDevice,
   getUserDevices,
+  deleteUserDevice,
+  listUserSessions,
+  revokeUserSession,
+  revokeOtherUserSessions,
+  eraseUserAccount,
+  getAccountLockout,
+  incrementLoginFailures,
+  setAccountLockout,
+  clearAccountLockout,
+  listAbacPolicies,
+  upsertAbacPolicy,
+  deleteAbacPolicy,
+  storePasswordResetToken,
+  consumePasswordResetToken,
   storeRefreshToken,
   isRefreshTokenValid,
   revokeRefreshToken,
@@ -1076,6 +1809,7 @@ module.exports = {
   markFamilyCompromised,
   storeMFASecret,
   getMFASecret,
+  deleteMFASecret,
   storeMFAChallenge,
   getMFAChallenge,
   deleteMFAChallenge,
@@ -1092,6 +1826,7 @@ module.exports = {
   recordLoginHistory,
   getRecentLogins,
   getLoginHistory,
+  getUserAccessHistory,
   getAnomalyProfile,
   updateAnomalyProfile,
   storeSigningKey,
@@ -1116,5 +1851,18 @@ module.exports = {
   recordAuditFeedback,
   getAuditFeedback,
   getRecentFeedback,
+  // multi-tenancy + federation
+  getTenant,
+  createTenant,
+  listTenants,
+  updateTenant,
+  linkFederatedIdentity,
+  getFederatedIdentity,
+  listUsersByTenant,
+  recordBillingEvent,
+  listBillingEvents,
+  setTenantStripeCustomer,
+  setTenantSubscription,
+  findTenantByStripeCustomer,
   _prepareStatements,
 };

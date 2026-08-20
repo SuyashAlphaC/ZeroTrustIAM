@@ -9,15 +9,18 @@
 <body>
 <script type="module">
   import { requireRole } from '/js/auth.js';
-  import { renderShell, pageHead, decisionPill, riskGauge, hashCopy, fmtTime, fmtRelative, toast, escape } from '/js/ui.js';
+  import {
+    renderShell, pageHead, decisionPill, riskGauge, hashCopy,
+    fmtTime, fmtRelative, fmtLocalTime, toast, escape,
+  } from '/js/ui.js';
   import { get, post } from '/js/api.js';
 
-  requireRole('admin');
+  await requireRole('admin');
   const main = renderShell({ section: 'admin', currentPath: '/admin/audit' });
   main.innerHTML = pageHead({
     crumb: 'Governance / Audit',
     title: '<em>Audit</em> log',
-    description: 'Every access decision recorded on Hyperledger Fabric. Filter, expand, and label entries to feed the ML training loop.',
+    description: 'Access decisions and admin lifecycle events from the policy engine audit store (mirrored with Fabric when available).',
     actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>
               <button class="btn btn-primary" id="export">Export CSV</button>`,
   }) + `
@@ -31,8 +34,13 @@
         <select class="select" id="f-decision">
           <option value="">All</option>
           <option value="ALLOW">ALLOW</option>
-          <option value="STEP_UP">STEP_UP</option>
           <option value="DENY">DENY</option>
+          <option value="MFA_REQUIRED">MFA_REQUIRED</option>
+          <option value="STEP_UP">STEP_UP</option>
+          <option value="MFA_DISABLED">MFA_DISABLED</option>
+          <option value="DEVICE_REGISTERED">DEVICE_REGISTERED</option>
+          <option value="USER_SUSPENDED">USER_SUSPENDED</option>
+          <option value="USER_EVICTED">USER_EVICTED</option>
         </select>
       </div>
       <div class="field">
@@ -62,13 +70,33 @@
   const $ = (s) => document.querySelector(s);
   const result = $('#result');
   let allRows = [];
-  let sortKey = 'timestamp', sortDir = 'desc';
+  let sortKey = 'timestamp';
+  let sortDir = 'desc';
+
+  function rowTs(r) {
+    return r.timestamp || r.createdAt || r.created_at || r.ts || null;
+  }
+  function rowUser(r) {
+    return r.userId || r.user_id || r.user || null;
+  }
+  function rowTx(r) {
+    return r.txId || r.tx_id || null;
+  }
+  function rowRisk(r) {
+    const v = r.riskScore ?? r.risk_score ?? r.risk;
+    return v == null || v === '' ? null : Number(v);
+  }
+  function rowDevice(r) {
+    return r.deviceId || r.device_id || null;
+  }
 
   async function load() {
     result.innerHTML = `<div class="empty"><p>Loading audit entries…</p></div>`;
     try {
-      const data = await get('/api/admin/audit');
-      allRows = Array.isArray(data) ? data : (data.entries || data.rows || []);
+      const data = await get('/api/admin/audit?limit=200');
+      allRows = Array.isArray(data)
+        ? data
+        : (data.entries || data.rows || data.audit || []);
       render();
     } catch (err) {
       result.innerHTML = `<div class="empty"><h3>Couldn't load audit log</h3><p>${escape(err.message)}</p></div>`;
@@ -83,14 +111,17 @@
     const minR = $('#f-min').value === '' ? null : parseFloat($('#f-min').value);
     const maxR = $('#f-max').value === '' ? null : parseFloat($('#f-max').value);
     return rows.filter((r) => {
-      if (user && !((r.userId || r.user || '').toLowerCase().includes(user))) return false;
+      const uname = (rowUser(r) || '').toLowerCase();
+      if (user && !uname.includes(user)) return false;
       if (dec && r.decision !== dec) return false;
-      const t = new Date(r.timestamp || r.ts || 0).getTime();
-      if (from && t < from) return false;
-      if (to && t > to) return false;
-      const risk = Number(r.riskScore ?? r.risk_score ?? r.risk);
+      const t = new Date(rowTs(r) || 0).getTime();
+      if (from && (!Number.isFinite(t) || t < from)) return false;
+      if (to && (!Number.isFinite(t) || t > to)) return false;
+      const risk = rowRisk(r);
       if (minR != null && Number.isFinite(risk) && risk < minR) return false;
       if (maxR != null && Number.isFinite(risk) && risk > maxR) return false;
+      // If filtering by risk, hide non-scored lifecycle rows unless both bounds empty
+      if ((minR != null || maxR != null) && risk == null) return false;
       return true;
     });
   }
@@ -98,10 +129,28 @@
   function sortRows(rows) {
     const dir = sortDir === 'asc' ? 1 : -1;
     return [...rows].sort((a, b) => {
-      const av = a[sortKey] ?? a[sortKey === 'riskScore' ? 'risk_score' : sortKey];
-      const bv = b[sortKey] ?? b[sortKey === 'riskScore' ? 'risk_score' : sortKey];
-      if (sortKey === 'timestamp') return (new Date(av).getTime() - new Date(bv).getTime()) * dir;
-      if (typeof av === 'number') return (av - bv) * dir;
+      let av;
+      let bv;
+      if (sortKey === 'timestamp') {
+        av = new Date(rowTs(a) || 0).getTime();
+        bv = new Date(rowTs(b) || 0).getTime();
+        return (av - bv) * dir;
+      }
+      if (sortKey === 'userId') {
+        av = rowUser(a) || '';
+        bv = rowUser(b) || '';
+        return String(av).localeCompare(String(bv)) * dir;
+      }
+      if (sortKey === 'riskScore') {
+        av = rowRisk(a);
+        bv = rowRisk(b);
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1 * dir;
+        if (bv == null) return -1 * dir;
+        return (av - bv) * dir;
+      }
+      av = a[sortKey];
+      bv = b[sortKey];
       return String(av || '').localeCompare(String(bv || '')) * dir;
     });
   }
@@ -122,7 +171,8 @@
               <th>Decision</th>
               <th class="sortable ${sortKey==='riskScore'?'sort-'+sortDir:''}" data-sort="riskScore">Risk</th>
               <th>Reason</th>
-              <th>Resource</th>
+              <th>Layer</th>
+              <th>Device</th>
               <th>Tx</th>
               <th></th>
             </tr>
@@ -138,71 +188,67 @@
   }
 
   function rowHtml(r, i) {
-    const ts = r.timestamp || r.ts;
-    const auditId = r.auditId || r.txId || r.id;
-    const risk = r.riskScore ?? r.risk_score;
-    const proofHash = r.proofHash || r.proof_hash;
+    const ts = rowTs(r);
+    const user = rowUser(r);
+    const tx = rowTx(r);
+    const risk = rowRisk(r);
+    const device = rowDevice(r);
+    const auditId = r.auditId || tx || r.id;
     return `
-      <tr data-i="${i}" data-id="${escape(auditId || '')}">
+      <tr data-i="${i}" data-id="${escape(auditId != null ? String(auditId) : '')}">
         <td>
-          <div>${escape(fmtRelative(ts))}</div>
-          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(ts))}</div>
+          <div>${escape(fmtLocalTime(ts))}</div>
+          <div class="t-small text-fg-2">${escape(fmtRelative(ts))}</div>
+          <div class="t-mono text-fg-3" style="font-size:10px">${escape(fmtTime(ts))}</div>
         </td>
-        <td>${escape(r.userId || r.user || '—')}</td>
+        <td><span class="t-mono">${escape(user || '—')}</span></td>
         <td>${decisionPill(r.decision)}</td>
-        <td class="num">${risk != null ? riskGauge(risk) : (proofHash ? '<span class="pill muted pill-no-dot">redacted (zkp)</span>' : '—')}</td>
+        <td class="num">${risk != null && Number.isFinite(risk) ? riskGauge(risk) : '<span class="t-mono text-fg-2">—</span>'}</td>
         <td><span class="t-small">${escape(r.reason || '—')}</span></td>
-        <td><span class="t-mono">${escape(r.resource || 'default')}</span></td>
-        <td>${hashCopy(r.txId)}</td>
+        <td><span class="t-small text-fg-2">${escape(r.layer || '—')}</span></td>
+        <td><span class="t-mono" style="font-size:11px" title="${escape(device || '')}">${escape(device ? (device.length > 14 ? device.slice(0, 12) + '…' : device) : '—')}</span></td>
+        <td>${tx ? hashCopy(tx, { length: 12 }) : '<span class="t-mono text-fg-2">—</span>'}</td>
         <td><button class="btn btn-ghost btn-sm" data-act="expand">Details</button></td>
       </tr>`;
   }
 
   function detailHtml(r) {
-    const proofHash = r.proofHash || r.proof_hash;
-    const ml = r.mlExplanation || r.ml_explanation || r.explanation;
-    const anomaly = r.anomalyFactors || r.anomaly_factors;
+    const ts = rowTs(r);
+    const user = rowUser(r);
+    const tx = rowTx(r);
+    const risk = rowRisk(r);
+    const device = rowDevice(r);
+    const meta = r.metadata;
     return `
       <tr class="row-detail">
-        <td colspan="8">
+        <td colspan="9">
           <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5)">
             <div>
-              <div class="t-h3 mb-3">Cryptographic evidence</div>
+              <div class="t-h3 mb-3">Entry</div>
               <dl>
-                <div class="detail-row"><dt>Proof hash</dt><dd>${proofHash ? hashCopy(proofHash, { length: 24 }) : '<span class="t-mono text-fg-2">none</span>'}</dd></div>
-                <div class="detail-row"><dt>ZKP scheme</dt><dd class="t-mono">${escape(r.zkpScheme || 'PedersenBitRangeProof')}</dd></div>
-                <div class="detail-row"><dt>Model version</dt><dd class="t-mono">${escape(r.modelVersion || '—')}</dd></div>
-                <div class="detail-row"><dt>Policy version</dt><dd class="t-mono">${escape(r.policyVersion || '—')}</dd></div>
-                <div class="detail-row"><dt>Tx ID</dt><dd>${hashCopy(r.txId, { length: 32 })}</dd></div>
+                <div class="detail-row"><dt>When (local)</dt><dd>${escape(fmtLocalTime(ts))}</dd></div>
+                <div class="detail-row"><dt>When (UTC)</dt><dd class="t-mono">${escape(fmtTime(ts))}</dd></div>
+                <div class="detail-row"><dt>User</dt><dd class="t-mono">${escape(user || '—')}</dd></div>
+                <div class="detail-row"><dt>Device</dt><dd class="t-mono">${escape(device || '—')}</dd></div>
+                <div class="detail-row"><dt>Decision</dt><dd>${decisionPill(r.decision)}</dd></div>
+                <div class="detail-row"><dt>Reason</dt><dd>${escape(r.reason || '—')}</dd></div>
+                <div class="detail-row"><dt>Layer</dt><dd class="t-mono">${escape(r.layer || '—')}</dd></div>
+                <div class="detail-row"><dt>Risk score</dt><dd>${risk != null && Number.isFinite(risk) ? riskGauge(risk) : '—'}</dd></div>
+                <div class="detail-row"><dt>Tx ID</dt><dd>${tx ? hashCopy(tx, { length: 32 }) : '—'}</dd></div>
+                <div class="detail-row"><dt>Record id</dt><dd class="t-mono">${escape(r.id != null ? String(r.id) : '—')}</dd></div>
               </dl>
             </div>
             <div>
-              <div class="t-h3 mb-3">Risk decomposition</div>
-              <dl>
-                ${r.ahpScore != null ? `<div class="detail-row"><dt>AHP</dt><dd>${riskGauge(r.ahpScore)}</dd></div>` : ''}
-                ${r.mlScore != null ? `<div class="detail-row"><dt>ML</dt><dd>${riskGauge(r.mlScore)}</dd></div>` : ''}
-                ${r.anomalyScore != null ? `<div class="detail-row"><dt>Anomaly</dt><dd>${riskGauge(r.anomalyScore)}</dd></div>` : ''}
-              </dl>
-              ${ml && Array.isArray(ml) ? `
-                <div class="t-h3 mt-4 mb-3">Top ML features</div>
-                <table class="table" style="background:transparent">
-                  <tbody>
-                    ${ml.slice(0, 5).map((f) => `
-                      <tr>
-                        <td class="t-mono">${escape(f.feature || f.name)}</td>
-                        <td class="num t-mono">${escape((f.value ?? '').toString().slice(0, 8))}</td>
-                        <td class="num t-mono text-fg-2">${escape(((f.contribution ?? f.importance ?? 0)).toFixed(3))}</td>
-                      </tr>`).join('')}
-                  </tbody>
-                </table>` : ''}
-              ${anomaly ? `<div class="t-small text-fg-2 mt-3">Anomaly factors: <span class="t-mono">${escape(typeof anomaly === 'string' ? anomaly : JSON.stringify(anomaly))}</span></div>` : ''}
+              <div class="t-h3 mb-3">Metadata</div>
+              ${meta
+                ? `<pre class="t-mono t-small" style="white-space:pre-wrap;word-break:break-all;background:var(--bg-2);padding:var(--s-4);border-radius:var(--radius)">${escape(typeof meta === 'string' ? meta : JSON.stringify(meta, null, 2))}</pre>`
+                : '<p class="t-small text-fg-2">No metadata on this entry.</p>'}
+              <div class="flex gap-2 mt-5 justify-end">
+                <span class="t-small text-fg-2 flex items-center" style="margin-right:auto">Label for ML training (access decisions)</span>
+                <button class="btn btn-secondary" data-fb="false_positive">False positive</button>
+                <button class="btn btn-secondary" data-fb="true_positive">True positive</button>
+              </div>
             </div>
-          </div>
-
-          <div class="flex gap-2 mt-5 justify-end">
-            <span class="t-small text-fg-2 flex items-center" style="margin-right:auto">Mark this decision to feed the ML training set</span>
-            <button class="btn btn-secondary" data-fb="false_positive">False positive</button>
-            <button class="btn btn-secondary" data-fb="true_positive">True positive</button>
           </div>
         </td>
       </tr>`;
@@ -218,7 +264,7 @@
       });
     });
     document.querySelectorAll('button[data-act=expand]').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
+      btn.addEventListener('click', () => {
         const tr = btn.closest('tr');
         const i = Number(tr.dataset.i);
         const next = tr.nextElementSibling;
@@ -235,11 +281,12 @@
         detail.querySelectorAll('button[data-fb]').forEach((b) => {
           b.addEventListener('click', async () => {
             const auditId = tr.dataset.id;
+            if (!auditId) { toast('No audit id for feedback', 'error'); return; }
             try {
               await post(`/api/admin/audit/${encodeURIComponent(auditId)}/feedback`, {
                 label: b.dataset.fb,
               });
-              toast('Feedback recorded · sample relabelled', 'success');
+              toast('Feedback recorded', 'success');
             } catch (err) { toast(err.message, 'error'); }
           });
         });
@@ -250,20 +297,27 @@
   $('#refresh').addEventListener('click', load);
   $('#apply').addEventListener('click', render);
   $('#clear').addEventListener('click', () => {
-    document.querySelectorAll('.filters input, .filters select').forEach((el) => el.value = '');
+    document.querySelectorAll('.filters input, .filters select').forEach((el) => { el.value = ''; });
     render();
   });
   $('#export').addEventListener('click', () => {
     const rows = applyFilters(allRows);
-    const csv = ['timestamp,user,decision,risk,reason,resource,txId']
+    const csv = ['timestamp,user,decision,risk,reason,layer,deviceId,txId']
       .concat(rows.map((r) => [
-        r.timestamp || r.ts, r.userId || r.user, r.decision,
-        r.riskScore ?? r.risk_score ?? '', JSON.stringify(r.reason || ''),
-        r.resource || 'default', r.txId || ''
+        rowTs(r) || '',
+        rowUser(r) || '',
+        r.decision || '',
+        rowRisk(r) ?? '',
+        JSON.stringify(r.reason || ''),
+        JSON.stringify(r.layer || ''),
+        rowDevice(r) || '',
+        rowTx(r) || '',
       ].join(','))).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = 'audit-' + Date.now() + '.csv'; a.click();
+    a.href = URL.createObjectURL(blob);
+    a.download = 'audit-' + Date.now() + '.csv';
+    a.click();
   });
 
   load();

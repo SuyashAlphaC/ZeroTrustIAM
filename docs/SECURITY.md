@@ -6,6 +6,44 @@ This document summarizes how the main components handle **secrets**, **transport
 
 Report suspected vulnerabilities to the repository maintainers (use private channels; do not open public issues for exploitable bugs until coordinated disclosure is complete).
 
+## Production hardening (implemented)
+
+| Control | Status |
+|---------|--------|
+| Self-service `/v1/me/*` (devices, sessions, export, erasure, password change) | Implemented |
+| Redis/Postgres shared failed-attempt counters + account lockout | Implemented |
+| Credential anti-enumeration (uniform error + dummy bcrypt) | Implemented |
+| Auth on MFA status, anomaly, audit-log, DID list | Implemented |
+| Password policy + optional Argon2id/scrypt hasher | Implemented |
+| Password reset flow (`/password-reset/*`) | Implemented |
+| SCIM 2.0 user provisioning (`/scim/v2`) | Implemented (subset) |
+| ABAC policy engine + admin CRUD | Implemented |
+| ZKP opt-in only; not a security boundary | Implemented |
+| Fabric fail-closed / soft failure modes | Implemented |
+| Non-root multi-stage Docker images + k8s securityContext | Implemented |
+| CI Trivy CRITICAL image scan on PRs | Implemented |
+
+See also `docs/SLO_AND_FAILURE_MODES.md`.
+
+## Enterprise features (phase 2)
+
+| Feature | Location |
+|---------|----------|
+| OIDC federation (Google / Entra / Okta) | `policy-engine/federation.js`, `/v1/federation/*` |
+| SAML 2.0 SP | `policy-engine/saml.js`, `/v1/federation/saml/*` |
+| Multi-tenancy + plans + CMK fields | `policy-engine/tenancy.js`, migration `008` |
+| External PDP (OPA / Cedar) | `policy-engine/externalPdp.js`, `policies/opa`, `policies/cedar` |
+| PEP SDK | `packages/pep-sdk` |
+| Gateway plugins | `packages/gateway-plugins` |
+| AWS KMS JWT signing | `kmsSigner.js` `AwsKmsSigner`, `KMS_BACKEND=aws` |
+| Admin SPA | `admin-console/` (Vite React) → `web-app/public/admin-console` |
+| Fabric CA multi-org ops | `fabric-network/scripts/ca-ops/`, `docs/FABRIC_CA_RUNBOOK.md` |
+| ZKP production policy | `docs/ZKP.md` (disabled by default) |
+| Stripe billing + admin UI | `billing.js`, `/admin-console/billing`, `docs/BILLING.md` |
+| Exclusive C14N SAML | `samlExclusiveC14n.js`, `samlXmlDSig.js`, `saml.js` |
+| Amazon Verified Permissions | `amazonVerifiedPermissions.js`, `PDP_BACKEND=avp`, `docs/AVP.md` |
+| Live Fabric CA CI | `.github/workflows/fabric-ca-ci.yaml`, `docker-compose.fabric-ca-ci.yaml` |
+
 ## Threat model reference
 
 See [`THREAT_MODEL.md`](./THREAT_MODEL.md) for design-level threats and mitigations.

@@ -1,16 +1,48 @@
-// Generate or retrieve a persistent device ID (simulates device fingerprinting)
-function getDeviceId() {
-  let deviceId = localStorage.getItem('zt-iam-device-id');
-  if (!deviceId) {
-    deviceId = 'dev-' + crypto.randomUUID();
-    localStorage.setItem('zt-iam-device-id', deviceId);
-  }
-  return deviceId;
-}
+// ZeroTrustIAM login client — opaque device binding + safe decision display.
+// Device credentials are never shown as editable form fields.
+// Risk scores must never be rendered (server also redacts them).
 
-// Display device ID on page
-const deviceId = getDeviceId();
-document.getElementById('deviceIdDisplay').textContent = deviceId;
+const DEVICE_STORAGE_KEY = 'zt-iam-device-credential';
+
+/**
+ * Stable opaque device credential for this browser profile.
+ * crypto.randomUUID when available; never a demo hardcode, never user-editable.
+ */
+function getDeviceCredential() {
+  try {
+    let id = localStorage.getItem(DEVICE_STORAGE_KEY);
+    // Migrate away from legacy hardcoded demo key if present as sole value
+    if (id === 'dev-001' || id === 'dev-002') {
+      id = null;
+      localStorage.removeItem(DEVICE_STORAGE_KEY);
+      localStorage.removeItem('zt-iam-device-id');
+    }
+    // Legacy key migration (opaque values only)
+    if (!id) {
+      const legacy = localStorage.getItem('zt-iam-device-id');
+      if (legacy && legacy !== 'dev-001' && legacy !== 'dev-002' && legacy.length >= 6) {
+        id = legacy;
+        localStorage.setItem(DEVICE_STORAGE_KEY, id);
+        localStorage.removeItem('zt-iam-device-id');
+      }
+    }
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : ('d_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+      localStorage.setItem(DEVICE_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    // Private mode fallback (session-only)
+    if (!window.__ztDeviceCred) {
+      window.__ztDeviceCred = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : ('d_' + Math.random().toString(36).slice(2));
+    }
+    return window.__ztDeviceCred;
+  }
+}
 
 let csrfTokenMemo = null;
 
@@ -52,7 +84,6 @@ async function checkSession() {
     if (result.valid) {
       showSession(result);
     } else {
-      // Try refresh (cookie is sent automatically)
       const refreshed = await tryRefreshToken();
       if (!refreshed) hideSession();
     }
@@ -65,7 +96,6 @@ async function tryRefreshToken() {
   try {
     const res = await apiPostJson('/api/refresh-token', {});
     if (!res.ok) return false;
-    // New cookies are set by server
     await checkSession();
     return true;
   } catch {
@@ -82,7 +112,7 @@ function showSession(sessionInfo) {
   const addRow = (label, value) => {
     html += `<div class="detail-row">
       <span class="detail-label">${label}</span>
-      <span class="detail-value">${value}</span>
+      <span class="detail-value">${escapeHtml(value)}</span>
     </div>`;
   };
 
@@ -97,7 +127,13 @@ function hideSession() {
   document.getElementById('sessionPanel').classList.add('hidden');
 }
 
-// Handle logout
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 document.getElementById('logoutBtn').addEventListener('click', async () => {
   try {
     await apiPostJson('/api/logout', {});
@@ -105,7 +141,6 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
   hideSession();
 });
 
-// Handle login form submission
 document.getElementById('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
 
@@ -116,9 +151,8 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
   const payload = {
     username: document.getElementById('username').value,
     password: document.getElementById('password').value,
-    deviceId: deviceId,
+    deviceId: getDeviceCredential(),
     timestamp: new Date().toISOString(),
-    ip: '192.168.1.100',
     location: {
       country: document.getElementById('locationCountry').value || 'IN',
       city: document.getElementById('locationCity').value || 'Gwalior',
@@ -128,29 +162,29 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 
   try {
     const response = await apiPostJson('/api/login', payload);
-
     const result = await response.json();
 
-    // Handle MFA step-up requirement
     if (result.decision === 'MFA_REQUIRED') {
       showMFAChallenge(result);
       return;
     }
 
-    // Session cookies are set automatically by the server
     if (result.tokenSet) {
       checkSession();
     }
 
     displayResult(result);
   } catch (err) {
-    displayResult({ decision: 'DENY', reason: 'Network error: ' + err.message });
+    displayResult({ decision: 'DENY', userMessage: 'Network error. Try again.', reason: 'Network error' });
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = 'Authenticate';
   }
 });
 
+/**
+ * Show decision only — never risk scores, breakdowns, or thresholds.
+ */
 function displayResult(result) {
   const resultDiv = document.getElementById('result');
   const banner = document.getElementById('resultBanner');
@@ -158,58 +192,37 @@ function displayResult(result) {
 
   resultDiv.classList.remove('hidden');
 
-  const isAllowed = result.decision === 'ALLOW';
-  banner.className = 'result-banner ' + (isAllowed ? 'allow' : 'deny');
-  banner.textContent = isAllowed ? 'ACCESS GRANTED' : 'ACCESS DENIED';
+  const decision = result.decision || 'DENY';
+  const isAllowed = decision === 'ALLOW';
+  const isMfa = decision === 'MFA_REQUIRED';
+  banner.className = 'result-banner ' + (isAllowed ? 'allow' : isMfa ? 'deny' : 'deny');
+  banner.textContent = isAllowed
+    ? 'ACCESS GRANTED'
+    : isMfa
+      ? 'VERIFICATION REQUIRED'
+      : 'ACCESS DENIED';
 
   let detailsHTML = '';
   const addRow = (label, value) => {
+    if (value == null || value === '') return;
     detailsHTML += `<div class="detail-row">
-      <span class="detail-label">${label}</span>
-      <span class="detail-value">${value}</span>
+      <span class="detail-label">${escapeHtml(label)}</span>
+      <span class="detail-value">${escapeHtml(value)}</span>
     </div>`;
   };
 
-  addRow('Decision', result.decision);
-  addRow('Reason', result.reason);
-
-  if (result.riskScore !== undefined) {
-    addRow('Risk Score', result.riskScore.toFixed(2));
-    if (result.baseRiskScore !== undefined && result.baseRiskScore !== result.riskScore) {
-      addRow('Base Risk', result.baseRiskScore.toFixed(2));
-    }
-  }
-
-  if (result.breakdown) {
-    addRow('Device Score', result.breakdown.d_score);
-    addRow('Location Score', result.breakdown.l_score);
-    addRow('Time Score', result.breakdown.t_score);
-    addRow('Attempt Score', result.breakdown.a_score);
-  }
-
-  if (result.anomaly && result.anomaly.anomalyDetected) {
-    addRow('Anomaly', 'Detected (score: ' + result.anomaly.combined + ')');
-  }
-
-  if (result.txId) addRow('Transaction ID', result.txId);
-  if (result.layer) addRow('Decided By', result.layer);
-
-  if (result.tokenSet) {
-    addRow('Session', 'Established (HttpOnly cookie)');
-    addRow('Token Expiry', result.tokenExpiry);
-  }
-
+  addRow('Status', decision);
+  addRow('Message', result.userMessage || result.reason || '—');
+  if (result.reasonCode) addRow('Code', result.reasonCode);
+  if (result.txId) addRow('Audit reference', result.txId);
+  if (result.tokenSet || result.accessToken) addRow('Session', 'Established (HttpOnly cookie)');
   if (result.mfaVerified) addRow('MFA', 'Verified');
+  if (result.deviceEnrolled) addRow('Device', 'Registered for this browser');
 
-  if (result.zkProof) {
-    addRow('ZK Proof', result.zkProof.proofId.slice(0, 12) + '...');
-    if (result.zkProof.experimental) addRow('ZKP Status', 'Experimental');
-  }
-
+  // Defense-in-depth: never render risk fields even if a misconfigured server leaks them
   details.innerHTML = detailsHTML;
 }
 
-// MFA challenge handling
 let pendingChallengeId = null;
 
 function showMFAChallenge(result) {
@@ -217,8 +230,9 @@ function showMFAChallenge(result) {
   const mfaPanel = document.getElementById('mfaPanel');
   const mfaReason = document.getElementById('mfaReason');
   mfaPanel.classList.remove('hidden');
-  mfaReason.textContent = result.reason;
+  mfaReason.textContent = result.userMessage || result.reason || 'Additional verification required.';
   document.getElementById('mfaCode').focus();
+  displayResult(result);
 }
 
 document.getElementById('mfaSubmitBtn').addEventListener('click', async () => {
@@ -238,7 +252,7 @@ document.getElementById('mfaSubmitBtn').addEventListener('click', async () => {
     const response = await apiPostJson('/api/mfa/challenge', { challengeId: pendingChallengeId, code });
     const result = await response.json();
 
-    if (result.tokenSet) {
+    if (result.tokenSet || result.accessToken) {
       checkSession();
     }
 
@@ -247,7 +261,7 @@ document.getElementById('mfaSubmitBtn').addEventListener('click', async () => {
     document.getElementById('mfaCode').value = '';
     pendingChallengeId = null;
   } catch (err) {
-    displayResult({ decision: 'DENY', reason: 'MFA verification error: ' + err.message });
+    displayResult({ decision: 'DENY', userMessage: 'Verification failed. Try again.', reason: 'MFA verification failed' });
   } finally {
     btn.disabled = false;
     btn.textContent = 'Verify MFA';

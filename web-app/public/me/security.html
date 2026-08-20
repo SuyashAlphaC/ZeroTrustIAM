@@ -8,11 +8,11 @@
 </head>
 <body>
 <script type="module">
-  import { requireAuth, getSession } from '/js/auth.js';
-  import { renderShell, pageHead, decisionPill, fmtTime, fmtRelative, toast, escape } from '/js/ui.js';
+  import { requireAuth } from '/js/auth.js';
+  import { renderShell, pageHead, decisionPill, fmtTime, fmtRelative, fmtLocalTime, toast, confirm, escape } from '/js/ui.js';
   import { get, post } from '/js/api.js';
 
-  const session = requireAuth();
+  const session = await requireAuth();
   const main = renderShell({ section: 'me', currentPath: '/me/security' });
 
   if (new URLSearchParams(location.search).get('denied') === 'role') {
@@ -135,13 +135,33 @@
   }
 
   function bindMfa() {
+    const disable = document.getElementById('totp-disable');
+    if (disable) disable.addEventListener('click', async () => {
+      const ok = await confirm({
+        title: 'Remove authenticator app?',
+        body: 'TOTP multi-factor will be turned off for your account. You can enrol again later. Step-up MFA will no longer apply until you re-enrol.',
+        danger: true,
+        confirmLabel: 'Remove MFA',
+      });
+      if (!ok) return;
+      try {
+        const r = await post('/api/mfa/disable', {});
+        if (r.disabled === false) throw new Error(r.message || 'MFA was not enrolled');
+        toast('Authenticator app removed', 'success');
+        const detail = document.getElementById('mfa-detail');
+        if (detail) detail.innerHTML = '';
+        loadMfa();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+
     const enroll = document.getElementById('totp-enroll');
     if (enroll) enroll.addEventListener('click', async () => {
       try {
-        const r = await post('/api/mfa/enroll', { username: session.username });
+        // Session cookie is forwarded as Bearer by the web-app proxy — no password needed.
+        const r = await post('/api/mfa/enroll', {});
         const detail = document.getElementById('mfa-detail');
-        const otpauth = r.otpauth_url || r.otpauthUrl;
-        const qr = r.qrcode || r.qr_data_url;
+        const otpauth = r.otpauth_url || r.otpauthUrl || r.otpauth;
+        const qr = r.qrcode || r.qr_data_url || r.qrCodeDataUrl;
         detail.innerHTML = `
           <div class="card" style="background:var(--bg-2)">
             <div class="card-body">
@@ -160,7 +180,8 @@
         document.getElementById('totp-confirm').addEventListener('click', async () => {
           const code = document.getElementById('totp-verify').value;
           try {
-            await post('/api/mfa/challenge', { username: session.username, code });
+            const v = await post('/api/mfa/verify', { code });
+            if (v.valid === false) throw new Error(v.reason || 'Invalid code');
             toast('TOTP enrolled', 'success');
             loadMfa();
           } catch (e) { toast(e.message, 'error'); }
@@ -172,10 +193,13 @@
     if (passkey) passkey.addEventListener('click', async () => {
       if (!window.PublicKeyCredential) { toast('This browser does not support WebAuthn', 'error'); return; }
       try {
-        const opts = await post('/api/webauthn/register/options', { username: session.username });
+        // Session-authenticated; no username/password in body.
+        const opts = await post('/api/webauthn/register/options', {});
         opts.challenge = base64urlToBuffer(opts.challenge);
-        opts.user.id = base64urlToBuffer(opts.user.id);
-        if (opts.excludeCredentials) opts.excludeCredentials.forEach((c) => c.id = base64urlToBuffer(c.id));
+        if (opts.user?.id) opts.user.id = base64urlToBuffer(opts.user.id);
+        if (opts.excludeCredentials) {
+          opts.excludeCredentials.forEach((c) => { if (c.id) c.id = base64urlToBuffer(c.id); });
+        }
         const cred = await navigator.credentials.create({ publicKey: opts });
         const att = {
           id: cred.id, rawId: bufferToBase64url(cred.rawId), type: cred.type,
@@ -184,7 +208,8 @@
             clientDataJSON: bufferToBase64url(cred.response.clientDataJSON),
           },
         };
-        await post('/api/webauthn/register/verify', { username: session.username, response: att });
+        const result = await post('/api/webauthn/register/verify', { response: att });
+        if (result.verified === false) throw new Error(result.reason || 'Passkey verification failed');
         toast('Passkey added', 'success');
         loadMfa();
       } catch (e) { toast(e.message || 'Passkey registration failed', 'error'); }
@@ -214,22 +239,35 @@
       }
       $('#logins').innerHTML = `
         <table class="table">
-          <thead><tr><th>When</th><th>Decision</th><th>From</th><th>Device</th><th>Reason</th></tr></thead>
+          <thead><tr><th>When</th><th>Decision</th><th>From</th><th>Device</th><th>Description</th></tr></thead>
           <tbody>
-            ${list.map((l) => `
+            ${list.map((l) => {
+              const ts = l.timestamp || l.ts;
+              const place = [l.city, l.country || (l.location && l.location.country)].filter(Boolean).join(', ') || '—';
+              const device = (l.deviceId || l.device_id || '');
+              const desc = l.userMessage || l.reason || '—';
+              const layer = l.layer ? String(l.layer) : '';
+              const code = l.reasonCode && l.reasonCode !== 'OK' ? l.reasonCode : '';
+              return `
               <tr>
                 <td>
-                  <div>${escape(fmtRelative(l.timestamp || l.ts))}</div>
-                  <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(l.timestamp || l.ts))}</div>
+                  <div>${escape(fmtLocalTime(ts))}</div>
+                  <div class="t-small text-fg-2">${escape(fmtRelative(ts))}</div>
+                  <div class="t-mono text-fg-3" style="font-size:10px">${escape(fmtTime(ts))}</div>
                 </td>
                 <td>${decisionPill(l.decision)}</td>
                 <td>
-                  <div>${escape(l.country || (l.location && l.location.country) || '—')}</div>
+                  <div>${escape(place)}</div>
                   <div class="t-mono text-fg-2" style="font-size:11px">${escape(l.ip || '')}</div>
                 </td>
-                <td><span class="t-mono">${escape((l.deviceId || l.device_id || '').slice(0, 14)) || '—'}</span></td>
-                <td><span class="t-small">${escape(l.reason || '—')}</span></td>
-              </tr>`).join('')}
+                <td><span class="t-mono" style="font-size:11px" title="${escape(device)}">${escape(device ? (device.length > 16 ? device.slice(0, 14) + '…' : device) : '—')}</span></td>
+                <td>
+                  <div class="t-small">${escape(desc)}</div>
+                  ${code ? `<div class="t-mono text-fg-3" style="font-size:10px">${escape(code)}</div>` : ''}
+                  ${layer ? `<div class="t-small text-fg-3">${escape(layer)}</div>` : ''}
+                </td>
+              </tr>`;
+            }).join('')}
           </tbody>
         </table>`;
     } catch (e) {

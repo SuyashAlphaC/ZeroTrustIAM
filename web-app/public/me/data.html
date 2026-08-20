@@ -8,11 +8,11 @@
 </head>
 <body>
 <script type="module">
-  import { requireAuth, getSession } from '/js/auth.js';
+  import { requireAuth } from '/js/auth.js';
   import { renderShell, pageHead, toast, confirm, escape } from '/js/ui.js';
   import { get, post, del } from '/js/api.js';
 
-  const session = requireAuth();
+  const session = await requireAuth();
   const main = renderShell({ section: 'me', currentPath: '/me/data' });
 
   main.innerHTML = pageHead({
@@ -92,32 +92,45 @@
     const btn = $('#export');
     btn.disabled = true; btn.textContent = 'Preparing archive…';
     try {
-      const blob = await get('/api/me/export', { expect: 'blob' });
+      let blob = await get('/api/me/export', { expect: 'blob' });
+      // Hardening: if something returned a non-Blob (object/string), wrap it
+      if (!(blob instanceof Blob)) {
+        const text = typeof blob === 'string' ? blob : JSON.stringify(blob, null, 2);
+        blob = new Blob([text], { type: 'application/json' });
+      }
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `ztiam-${session.username || 'me'}-${Date.now()}.json`;
+      a.href = url;
+      a.download = `ztiam-${session.username || session.user?.username || 'me'}-${Date.now()}.json`;
+      document.body.appendChild(a);
       a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
       toast('Archive downloaded', 'success');
-    } catch (e) { toast(e.message, 'error'); }
+    } catch (e) { toast(e.message || 'Download failed', 'error'); }
     finally { btn.disabled = false; btn.textContent = 'Generate & download'; }
   });
 
   $('#erase').addEventListener('click', async () => {
+    // Confirm first, then ask for typed DELETE in a second step (modal closes after confirm)
     const ok = await confirm({
       title: 'Erase your account?',
-      body: `Type <b>DELETE</b> in the field below to confirm. This action is irreversible.<br><br>
-        <input class="input mono mt-2" id="erase-confirm" placeholder="DELETE" autocomplete="off">`,
-      danger: true, confirmLabel: 'Erase forever',
+      body: 'This permanently deletes your profile, devices, MFA, and sessions from operational stores. Audit records remain as redacted tombstones. This cannot be undone.',
+      danger: true, confirmLabel: 'Continue…',
     });
     if (!ok) return;
-    const text = document.getElementById('erase-confirm')?.value;
-    if (text !== 'DELETE') {
-      // user typed wrong text; the confirmation modal already closed, so re-prompt
+    const typed = window.prompt('Type DELETE (all caps) to permanently erase your account:');
+    if (typed !== 'DELETE') {
       toast('You must type DELETE exactly to confirm', 'error');
       return;
     }
     try {
-      await del('/api/me/account');
+      // Admin accounts need an extra confirmation header (policy-engine guard)
+      const headers = {};
+      if ((session.role || session.user?.role) === 'admin') {
+        headers['X-Confirm-Admin-Erase'] = 'ERASE-ADMIN';
+      }
+      await del('/api/me/account', { headers });
       toast('Account erased. Redirecting…', 'success');
       setTimeout(() => { sessionStorage.clear(); location.href = '/'; }, 1200);
     } catch (e) { toast(e.message, 'error'); }

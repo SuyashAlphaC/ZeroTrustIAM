@@ -1,0 +1,70 @@
+name: Fabric CA CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fabric-network/**'
+      - '.github/workflows/fabric-ca-ci.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'fabric-network/**'
+      - '.github/workflows/fabric-ca-ci.yaml'
+  workflow_dispatch:
+
+jobs:
+  fabric-ca-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Fabric CA pods (org1, org2, orderer)
+        run: |
+          docker compose -f fabric-network/docker-compose.fabric-ca-ci.yaml up -d
+          # Wait for ports
+          for port in 17054 17055 17056; do
+            for i in $(seq 1 30); do
+              if nc -z 127.0.0.1 $port 2>/dev/null; then
+                echo "port $port open"
+                break
+              fi
+              sleep 2
+            done
+          done
+          docker compose -f fabric-network/docker-compose.fabric-ca-ci.yaml ps
+
+      - name: Install Fabric CA client
+        run: |
+          # Prefer binary from repo if present
+          if [ -x fabric-network/bin/fabric-ca-client ]; then
+            echo "Using repo fabric-ca-client"
+            echo "$(pwd)/fabric-network/bin" >> "$GITHUB_PATH"
+          else
+            curl -sSL https://github.com/hyperledger/fabric-ca/releases/download/v1.5.13/hyperledger-fabric-ca-linux-amd64-1.5.13.tar.gz \
+              | tar xz
+            sudo mv bin/fabric-ca-client /usr/local/bin/
+            fabric-ca-client version
+          fi
+
+      - name: Multi-org enroll smoke
+        env:
+          ORG1_CA_URL: http://admin:adminpw@localhost:17054
+          ORG2_CA_URL: http://admin:adminpw@localhost:17055
+          ORDERER_CA_URL: http://admin:adminpw@localhost:17056
+        run: |
+          chmod +x fabric-network/scripts/ca-ops/*.sh
+          ./fabric-network/scripts/ca-ops/ci-smoke.sh
+
+      - name: Upload connection profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection-profile-prod
+          path: fabric-network/connection-profile-prod.json
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f fabric-network/docker-compose.fabric-ca-ci.yaml down -v

@@ -9,24 +9,95 @@
 <body>
 <script type="module">
   import { requireAuth } from '/js/auth.js';
-  import { renderShell, pageHead, hashCopy, fmtRelative, fmtTime, toast, confirm, escape } from '/js/ui.js';
-  import { get, del } from '/js/api.js';
+  import {
+    renderShell, pageHead, hashCopy,
+    fmtRelative, fmtTime, fmtLocalTime, toast, confirm, escape,
+  } from '/js/ui.js';
+  import { get, del, post } from '/js/api.js';
 
-  requireAuth();
+  await requireAuth();
   const main = renderShell({ section: 'me', currentPath: '/me/devices' });
+
+  /** Opaque browser credential — same key as login client; never user-typed. */
+  function currentDeviceCredential() {
+    try {
+      let id = localStorage.getItem('zt-iam-device-credential');
+      if (!id) {
+        id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : ('d_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+        localStorage.setItem('zt-iam-device-credential', id);
+      }
+      return id;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Human-readable browser/OS from a UA or short label. */
+  function parseDeviceLabel(raw) {
+    const s = String(raw || '').trim();
+    if (!s || s === 'Browser' || s === 'Unknown device') {
+      return { title: 'Trusted browser', detail: '' };
+    }
+    // Already a short friendly label
+    if (s.length < 40 && !/mozilla|webkit|chrome|safari|firefox|edg/i.test(s)) {
+      return { title: s, detail: '' };
+    }
+    let browser = 'Browser';
+    let os = '';
+    if (/Edg\//i.test(s)) browser = 'Microsoft Edge';
+    else if (/Chrome\//i.test(s) && !/Edg\//i.test(s)) browser = 'Chrome';
+    else if (/Firefox\//i.test(s)) browser = 'Firefox';
+    else if (/Safari\//i.test(s) && !/Chrome\//i.test(s)) browser = 'Safari';
+    else if (/OPR\//i.test(s)) browser = 'Opera';
+
+    if (/Windows NT/i.test(s)) os = 'Windows';
+    else if (/Mac OS X|Macintosh/i.test(s)) os = 'macOS';
+    else if (/Android/i.test(s)) os = 'Android';
+    else if (/iPhone|iPad/i.test(s)) os = 'iOS';
+    else if (/Linux/i.test(s)) os = 'Linux';
+    else if (/CrOS/i.test(s)) os = 'ChromeOS';
+
+    const ver = (s.match(/(?:Chrome|Firefox|Edg|Version|OPR)\/(\d+)/i) || [])[1];
+    const title = ver ? `${browser} ${ver}` : browser;
+    return { title, detail: os };
+  }
+
+  function friendlyName(d, isCurrent) {
+    if (isCurrent) return { title: 'This browser', detail: parseDeviceLabel(d.label).detail || parseDeviceLabel(d.label).title };
+    if (!d.label) {
+      // Seed / legacy devices without labels
+      if (String(d.deviceId || '').startsWith('dev-')) {
+        return { title: 'Registered device', detail: 'Seed / legacy credential' };
+      }
+      return { title: 'Trusted browser', detail: '' };
+    }
+    return parseDeviceLabel(d.label);
+  }
+
   main.innerHTML = pageHead({
     crumb: 'Account / Devices',
     title: '<em>Trusted</em> devices',
-    description: 'Browsers and devices that have signed in to your account. Revoke any you do not recognise.',
+    description: 'Browsers bound to your account via private device credentials (not user-editable IDs). Revoke any you do not recognise.',
+    actions: `<button class="btn btn-primary" id="register-this">Trust this browser</button>`,
   }) + `<div id="content"></div>`;
 
   const $ = (s) => document.querySelector(s);
+  const thisDeviceId = currentDeviceCredential();
 
   async function load() {
     $('#content').innerHTML = `<div class="empty"><p>Loading devices…</p></div>`;
     try {
-      const data = await get('/api/me/devices');
-      const list = Array.isArray(data) ? data : (data.devices || []);
+      const q = thisDeviceId ? `?current=${encodeURIComponent(thisDeviceId)}` : '';
+      const data = await get('/api/me/devices' + q);
+      let list = Array.isArray(data) ? data : (data.devices || []);
+      // Mark current client-side as well (belt and suspenders)
+      list = list.map((d) => ({
+        ...d,
+        current: !!(d.current || (thisDeviceId && (d.deviceId === thisDeviceId || d.device_id === thisDeviceId))),
+        trusted: d.trusted !== false,
+      }));
       render(list);
     } catch (err) {
       $('#content').innerHTML = `<div class="empty"><h3>Couldn't load devices</h3><p>${escape(err.message)}</p></div>`;
@@ -35,21 +106,29 @@
 
   function render(devices) {
     if (!devices.length) {
-      $('#content').innerHTML = `<div class="empty"><h3>No registered devices</h3><p>Sign in from a browser to register one.</p></div>`;
+      $('#content').innerHTML = `<div class="empty">
+        <h3>No registered devices</h3>
+        <p>Click <b>Trust this browser</b> to bind a private credential, or sign in again so auto-enrol can register one.</p>
+      </div>`;
       return;
     }
     const current = devices.find((d) => d.current) || null;
+    const trustedN = devices.filter((d) => d.trusted !== false).length;
+    const currentName = current ? friendlyName(current, true) : null;
+
     $('#content').innerHTML = `
       <div class="stat-grid">
         <div class="stat">
           <div class="stat-label">Registered</div>
           <div class="stat-value">${devices.length}</div>
-          <div class="stat-meta">${devices.filter((d) => d.trusted).length} trusted · ${devices.filter((d) => !d.trusted).length} unverified</div>
+          <div class="stat-meta">${trustedN} trusted credential${trustedN === 1 ? '' : 's'}</div>
         </div>
         <div class="stat">
-          <div class="stat-label">Current</div>
-          <div class="stat-value" style="font-size:18px;font-family:var(--font-ui)">${escape(current?.label || current?.userAgent || 'this browser')}</div>
-          <div class="stat-meta">${current ? fmtRelative(current.lastSeenAt || current.last_seen_at) : '—'}</div>
+          <div class="stat-label">This browser</div>
+          <div class="stat-value" style="font-size:18px;font-family:var(--font-ui)">${escape(currentName ? currentName.title : 'not registered')}</div>
+          <div class="stat-meta">${current
+            ? escape(fmtRelative(current.lastSeenAt || current.registeredAt))
+            : 'Use “Trust this browser” to bind it'}</div>
         </div>
       </div>
       <div class="card">
@@ -57,7 +136,7 @@
         <div class="card-body" style="padding:0">
           <table class="table">
             <thead>
-              <tr><th>Device</th><th>Last seen</th><th>From</th><th>Device ID</th><th></th></tr>
+              <tr><th>Device</th><th>Last seen</th><th>From</th><th>Credential</th><th></th></tr>
             </thead>
             <tbody>
               ${devices.map((d) => deviceRow(d)).join('')}
@@ -70,29 +149,37 @@
 
   function deviceRow(d) {
     const id = d.deviceId || d.device_id || d.id;
-    const last = d.lastSeenAt || d.last_seen_at || d.lastSeen;
+    const last = d.lastSeenAt || d.last_seen_at || d.registeredAt || d.registered_at;
+    const isCurrent = !!d.current;
+    const name = friendlyName(d, isCurrent);
+    const place = [d.city, d.country].filter(Boolean).join(', ') || '—';
+    const lastLabel = d.lastSeenAtSource === 'registered' && !d.lastSeenAt
+      ? 'Registered'
+      : null;
     return `
-      <tr data-id="${escape(id)}" data-current="${d.current ? '1' : ''}">
+      <tr data-id="${escape(id)}" data-current="${isCurrent ? '1' : ''}">
         <td>
           <div class="flex items-center gap-3">
-            ${d.current ? '<span class="pill allow">current</span>' : ''}
+            ${isCurrent ? '<span class="pill allow">current</span>' : '<span class="pill allow pill-no-dot">trusted</span>'}
             <div>
-              <div>${escape(d.label || d.name || d.userAgent || 'Unknown device')}</div>
-              <div class="t-small text-fg-2">${escape((d.os || '') + (d.browser ? ' · ' + d.browser : ''))}</div>
+              <div>${escape(name.title)}</div>
+              <div class="t-small text-fg-2">${escape(name.detail || '')}</div>
             </div>
           </div>
         </td>
         <td>
-          <div>${escape(fmtRelative(last))}</div>
-          <div class="t-mono text-fg-2" style="font-size:11px">${escape(fmtTime(last))}</div>
+          <div>${escape(last ? fmtLocalTime(last) : '—')}</div>
+          <div class="t-small text-fg-2">${escape(last ? fmtRelative(last) : '—')}${lastLabel ? ' · ' + lastLabel : ''}</div>
+          <div class="t-mono text-fg-3" style="font-size:10px">${escape(last ? fmtTime(last) : '')}</div>
         </td>
         <td>
-          <div>${escape((d.location && (d.location.city + ', ' + d.location.country)) || d.country || '—')}</div>
-          <div class="t-mono text-fg-2" style="font-size:11px">${escape(d.lastIp || d.last_ip || '')}</div>
+          <div>${escape(place)}</div>
+          ${d.lastDecision ? `<div class="t-small text-fg-2">${escape(d.lastDecision)}</div>` : ''}
         </td>
         <td>${hashCopy(id, { length: 14 })}</td>
         <td>
-          <button class="btn btn-ghost btn-sm" data-act="revoke" ${d.current ? 'disabled title="Revoking the current device would log you out"' : ''}>Revoke</button>
+          <button class="btn btn-ghost btn-sm" data-act="revoke"
+            ${isCurrent ? 'disabled title="Revoking the current device would lock you out of this browser"' : ''}>Revoke</button>
         </td>
       </tr>`;
   }
@@ -104,7 +191,7 @@
         const id = tr.dataset.id;
         const ok = await confirm({
           title: 'Revoke this device?',
-          body: 'Future sign-ins from this device will be flagged as unknown and will incur a higher risk score (likely STEP_UP or DENY).',
+          body: 'Future sign-ins from this browser will require re-verification. The private device credential is unbound from your account.',
           danger: true, confirmLabel: 'Revoke',
         });
         if (!ok) return;
@@ -116,6 +203,33 @@
       });
     });
   }
+
+  function browserLabel() {
+    const parsed = parseDeviceLabel(navigator.userAgent || '');
+    return parsed.detail ? `${parsed.title} on ${parsed.detail}` : parsed.title;
+  }
+
+  document.getElementById('register-this').addEventListener('click', async () => {
+    const deviceId = currentDeviceCredential();
+    if (!deviceId) {
+      toast('Could not create a device credential in this browser', 'error');
+      return;
+    }
+    const ok = await confirm({
+      title: 'Trust this browser?',
+      body: 'A private device credential for this browser will be bound to your account. You will not need to type any device ID.',
+      confirmLabel: 'Trust browser',
+    });
+    if (!ok) return;
+    try {
+      await post('/api/me/devices', {
+        deviceId,
+        label: browserLabel(),
+      });
+      toast('This browser is now trusted', 'success');
+      load();
+    } catch (err) { toast(err.message, 'error'); }
+  });
 
   load();
 </script>

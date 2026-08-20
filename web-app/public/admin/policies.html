@@ -12,7 +12,7 @@
   import { renderShell, pageHead, hashCopy, fmtTime, toast, escape } from '/js/ui.js';
   import { get, post } from '/js/api.js';
 
-  requireRole('admin');
+  await requireRole('admin');
   const main = renderShell({ section: 'admin', currentPath: '/admin/policies' });
   main.innerHTML = pageHead({
     crumb: 'Governance / Policies',

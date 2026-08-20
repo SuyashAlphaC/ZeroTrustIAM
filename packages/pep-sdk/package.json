@@ -1,0 +1,19 @@
+{
+  "name": "@ztiam/pep-sdk",
+  "version": "1.0.0",
+  "description": "ZeroTrustIAM Policy Enforcement Point SDK — verify JWTs and access grants at API gateways",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "middleware", "README.md"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "express": ">=4"
+  },
+  "keywords": ["zero-trust", "iam", "pep", "jwt", "gateway"],
+  "license": "Apache-2.0"
+}

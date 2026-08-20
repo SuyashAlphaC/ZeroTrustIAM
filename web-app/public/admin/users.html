@@ -3,42 +3,56 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Users · ZeroTrust IAM</title>
+  <title>User management · ZeroTrust IAM</title>
   <link rel="stylesheet" href="/styles/ztiam.css">
 </head>
 <body>
 <script type="module">
-  import { requireRole } from '/js/auth.js';
-  import { renderShell, pageHead, sparkline, fmtRelative, toast, confirm, escape } from '/js/ui.js';
-  import { get, post } from '/js/api.js';
+  import { requireRole, getSession } from '/js/auth.js';
+  import { renderShell, pageHead, fmtRelative, toast, confirm, escape } from '/js/ui.js';
+  import { get, post, del, api } from '/js/api.js';
 
-  requireRole('admin');
+  const me = await requireRole('admin');
   const main = renderShell({ section: 'admin', currentPath: '/admin/users' });
+
   main.innerHTML = pageHead({
     crumb: 'Governance / Users',
-    title: '<em>User</em> directory',
-    description: 'Every account, last activity, and risk trajectory. Operator actions audit on the same chain as access decisions.',
-    actions: `<button class="btn btn-secondary" id="refresh">Refresh</button>`,
+    title: '<em>User</em> management',
+    description: 'Register accounts, suspend or re-activate, revoke sessions, and permanently evict leavers. Dual-writes Postgres + Fabric.',
+    actions: `
+      <button class="btn btn-secondary" id="refresh">Refresh</button>
+      <button class="btn btn-primary" id="btn-create">New user</button>`,
   }) + `
     <div class="filters">
       <div class="field" style="flex:2">
         <label class="field-label" for="q">Search</label>
-        <input class="input" id="q" placeholder="username, email, role…">
+        <input class="input" id="q" placeholder="username, role, status…">
       </div>
       <div class="field">
-        <label class="field-label" for="role">Role</label>
-        <select class="select" id="role">
-          <option value="">All</option>
+        <label class="field-label" for="f-role">Role</label>
+        <select class="select" id="f-role">
+          <option value="">All roles</option>
           <option value="admin">admin</option>
-          <option value="user">user</option>
-          <option value="auditor">auditor</option>
+          <option value="editor">editor</option>
+          <option value="viewer">viewer</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="field-label" for="f-status">Status</label>
+        <select class="select" id="f-status">
+          <option value="">All statuses</option>
+          <option value="ACTIVE" selected>ACTIVE</option>
+          <option value="SUSPENDED">SUSPENDED</option>
+          <option value="DELETED">DELETED</option>
         </select>
       </div>
     </div>
-    <div id="content"></div>`;
+    <div id="content"></div>
+    <div id="drawer"></div>`;
 
   const $ = (s) => document.querySelector(s);
   let allUsers = [];
+  const selfUser = me.username || me.user?.username || getSession()?.username;
 
   async function load() {
     $('#content').innerHTML = `<div class="empty"><p>Loading users…</p></div>`;
@@ -53,21 +67,31 @@
 
   function filtered() {
     const q = $('#q').value.trim().toLowerCase();
-    const role = $('#role').value;
+    const role = $('#f-role').value;
+    const status = $('#f-status').value;
     return allUsers.filter((u) => {
+      const uname = u.username || u.userId || u.user_id || '';
+      const st = (u.status || 'ACTIVE').toUpperCase();
       if (role && u.role !== role) return false;
+      if (status && st !== status) return false;
       if (q) {
-        const blob = (u.username + ' ' + (u.email || '') + ' ' + (u.role || '')).toLowerCase();
+        const blob = `${uname} ${u.email || ''} ${u.role || ''} ${st}`.toLowerCase();
         if (!blob.includes(q)) return false;
       }
       return true;
     });
   }
 
+  function statusPill(st) {
+    const s = (st || 'ACTIVE').toUpperCase();
+    const cls = s === 'ACTIVE' ? 'allow' : s === 'SUSPENDED' ? 'stepup' : 'deny';
+    return `<span class="pill ${cls} pill-no-dot">${escape(s)}</span>`;
+  }
+
   function render() {
     const rows = filtered();
     if (!rows.length) {
-      $('#content').innerHTML = `<div class="empty"><h3>No users match</h3></div>`;
+      $('#content').innerHTML = `<div class="empty"><h3>No users match</h3><p>Create an account or clear filters.</p></div>`;
       return;
     }
     $('#content').innerHTML = `
@@ -77,90 +101,353 @@
             <tr>
               <th>User</th>
               <th>Role</th>
+              <th>Status</th>
               <th>Last login</th>
-              <th>Risk trend</th>
-              <th>Sessions</th>
               <th>Devices</th>
+              <th>Sessions</th>
               <th>MFA</th>
               <th></th>
             </tr>
           </thead>
-          <tbody>
-            ${rows.map(rowHtml).join('')}
-          </tbody>
+          <tbody>${rows.map(rowHtml).join('')}</tbody>
         </table>
       </div>
       <div class="t-small text-fg-2 mt-3">${rows.length} of ${allUsers.length} users</div>`;
-    bind();
+    bindRows();
   }
 
   function rowHtml(u) {
-    const initials = (u.username || '?').slice(0, 2).toUpperCase();
+    const username = u.username || u.userId || u.user_id;
+    const initials = (username || '?').slice(0, 2).toUpperCase();
     const last = u.lastLoginAt || u.last_login_at;
-    const trend = Array.isArray(u.recentRiskScores) ? u.recentRiskScores
-                  : Array.isArray(u.recent_risk_scores) ? u.recent_risk_scores
-                  : [];
-    const sessions = u.activeSessions ?? u.active_sessions ?? 0;
-    const devices = u.deviceCount ?? u.device_count ?? (Array.isArray(u.devices) ? u.devices.length : '—');
-    const mfa = u.mfaEnabled ?? u.mfa_enabled;
+    const st = (u.status || 'ACTIVE').toUpperCase();
+    const isSelf = username === selfUser;
+    const dead = st === 'DELETED';
     return `
-      <tr data-username="${escape(u.username)}">
+      <tr data-username="${escape(username)}" data-status="${escape(st)}">
         <td>
           <div class="flex items-center gap-3">
             <span class="user-avatar">${escape(initials)}</span>
             <div>
-              <div>${escape(u.username)}</div>
-              <div class="t-small text-fg-2">${escape(u.email || u.sub || '—')}</div>
+              <div>${escape(username)}${isSelf ? ' <span class="t-small text-fg-3">(you)</span>' : ''}</div>
+              <div class="t-small text-fg-2">${escape(u.email || u.usualCountry || '—')}</div>
             </div>
           </div>
         </td>
-        <td><span class="pill muted pill-no-dot">${escape(u.role || 'user')}</span></td>
+        <td><span class="pill muted pill-no-dot">${escape(u.role || 'viewer')}</span></td>
+        <td>${statusPill(st)}</td>
         <td>
-          <div>${escape(fmtRelative(last))}</div>
-          <div class="t-mono text-fg-2" style="font-size:11px">${u.lastLoginCountry || u.last_login_country ? escape(u.lastLoginCountry || u.last_login_country) : ''}</div>
+          <div>${last ? escape(fmtRelative(last)) : '—'}</div>
+          <div class="t-mono text-fg-2" style="font-size:11px">${escape(u.lastLoginCountry || '')}${u.lastLoginDecision ? ' · ' + escape(u.lastLoginDecision) : ''}</div>
         </td>
-        <td>${trend.length ? sparkline(trend, { threshold: 0.6 }) : '<span class="t-mono text-fg-2">—</span>'}</td>
-        <td class="num t-mono">${escape(sessions)}</td>
-        <td class="num t-mono">${escape(devices)}</td>
-        <td>${mfa ? '<span class="pill allow pill-no-dot">on</span>' : '<span class="pill muted pill-no-dot">off</span>'}</td>
+        <td class="num t-mono">${escape(u.deviceCount ?? 0)}</td>
+        <td class="num t-mono">${escape(u.activeSessions ?? 0)}</td>
+        <td>${u.mfaEnabled ? '<span class="pill allow pill-no-dot">on</span>' : '<span class="pill muted pill-no-dot">off</span>'}</td>
         <td>
-          <div class="flex gap-1 justify-end">
-            <button class="btn btn-ghost btn-sm" data-act="step-up">Force MFA</button>
-            <button class="btn btn-ghost btn-sm" data-act="revoke">Revoke sessions</button>
-            <button class="btn btn-ghost btn-sm" data-act="reset">Reset password</button>
+          <div class="flex gap-1 justify-end flex-wrap">
+            <button class="btn btn-ghost btn-sm" data-act="detail">Details</button>
+            ${dead ? '' : `
+              ${st === 'ACTIVE' ? `<button class="btn btn-ghost btn-sm" data-act="suspend" ${isSelf ? 'disabled' : ''}>Suspend</button>` : ''}
+              ${st === 'SUSPENDED' ? `<button class="btn btn-ghost btn-sm" data-act="activate">Activate</button>` : ''}
+              <button class="btn btn-ghost btn-sm" data-act="revoke">Revoke sessions</button>
+              <button class="btn btn-ghost btn-sm" data-act="reset">Reset password</button>
+              <button class="btn btn-ghost btn-sm" data-act="evict" ${isSelf ? 'disabled' : ''} style="color:var(--deny)">Evict</button>
+            `}
           </div>
         </td>
       </tr>`;
   }
 
-  function bind() {
+  function bindRows() {
     document.querySelectorAll('tbody tr').forEach((tr) => {
       const username = tr.dataset.username;
       tr.querySelectorAll('button[data-act]').forEach((btn) => {
-        btn.addEventListener('click', async () => action(btn.dataset.act, username));
+        btn.addEventListener('click', () => handleAction(btn.dataset.act, username));
       });
     });
   }
 
-  async function action(act, username) {
-    const labels = {
-      'step-up': { title: 'Force MFA on next login?', body: `${escape(username)} will be required to complete MFA on their next access decision regardless of risk.`, label: 'Force MFA' },
-      'revoke':  { title: 'Revoke all sessions?', body: `All active refresh tokens and access grants for <b>${escape(username)}</b> will be invalidated. Active session bearer tokens expire after their natural TTL.`, label: 'Revoke', danger: true },
-      'reset':   { title: 'Issue password reset?', body: `A reset link will be generated for <b>${escape(username)}</b>. The link is valid for 30 minutes.`, label: 'Issue reset' },
-    };
-    const c = labels[act];
-    const ok = await confirm({ title: c.title, body: c.body, danger: c.danger, confirmLabel: c.label });
-    if (!ok) return;
-    try {
-      await post(`/api/admin/users/${encodeURIComponent(username)}/${act}`, {});
-      toast(`${c.label} succeeded for ${username}`, 'success');
-      load();
-    } catch (err) { toast(err.message, 'error'); }
+  async function handleAction(act, username) {
+    if (act === 'detail') return openDetail(username);
+    if (act === 'create') return openCreate();
+    if (act === 'suspend') {
+      const ok = await confirm({
+        title: `Suspend ${username}?`,
+        body: 'They cannot sign in. Active sessions will be revoked. Status is dual-written to Fabric when available.',
+        danger: true, confirmLabel: 'Suspend',
+      });
+      if (!ok) return;
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(username)}/status`, {
+          method: 'PATCH', body: { status: 'SUSPENDED' },
+        });
+        toast(`${username} suspended`, 'success');
+        load();
+      } catch (e) { toast(e.message, 'error'); }
+      return;
+    }
+    if (act === 'activate') {
+      const ok = await confirm({
+        title: `Re-activate ${username}?`,
+        body: 'Account returns to ACTIVE. They can sign in again with their password.',
+        confirmLabel: 'Activate',
+      });
+      if (!ok) return;
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(username)}/status`, {
+          method: 'PATCH', body: { status: 'ACTIVE' },
+        });
+        toast(`${username} activated`, 'success');
+        load();
+      } catch (e) { toast(e.message, 'error'); }
+      return;
+    }
+    if (act === 'revoke') {
+      const ok = await confirm({
+        title: 'Revoke all sessions?',
+        body: `All refresh tokens for <b>${escape(username)}</b> will be invalidated immediately.`,
+        danger: true, confirmLabel: 'Revoke sessions',
+      });
+      if (!ok) return;
+      try {
+        await post(`/api/admin/users/${encodeURIComponent(username)}/revoke-sessions`, {});
+        toast('Sessions revoked', 'success');
+        load();
+      } catch (e) { toast(e.message, 'error'); }
+      return;
+    }
+    if (act === 'reset') return openResetPassword(username);
+    if (act === 'evict') {
+      const ok = await confirm({
+        title: `Evict ${username}?`,
+        body: `<p>This is permanent operational removal:</p>
+          <ul style="margin:12px 0 0 18px;color:var(--fg-1)">
+            <li>Password and devices wiped</li>
+            <li>Sessions revoked</li>
+            <li>PII redacted; status becomes DELETED</li>
+            <li>Audit trail retained as tombstones</li>
+          </ul>
+          <p class="mt-3">You cannot reverse this from the UI.</p>`,
+        danger: true, confirmLabel: 'Evict permanently',
+      });
+      if (!ok) return;
+      try {
+        const r = await post(`/api/admin/users/${encodeURIComponent(username)}/evict`, {});
+        toast(`Evicted ${username}` + (r.redactionId ? ` · ${r.redactionId.slice(0, 8)}…` : ''), 'success', 5000);
+        load();
+      } catch (e) { toast(e.message, 'error'); }
+    }
   }
 
+  function openCreate() {
+    const back = document.createElement('div');
+    back.className = 'modal-backdrop';
+    back.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:480px">
+        <div class="modal-head"><h2 class="t-h2">Register new user</h2></div>
+        <div class="modal-body">
+          <p class="t-small text-fg-2 mb-4">Creates the account in Postgres and on Fabric. Email/phone receive lifecycle notifications. Device IDs are not assigned — the user’s browser binds on first sign-in.</p>
+          <form id="create-form">
+            <div class="field">
+              <label class="field-label" for="c-user">Username</label>
+              <input class="input" id="c-user" required pattern="[A-Za-z0-9]{2,50}" autocomplete="off" placeholder="dave">
+            </div>
+            <div class="field">
+              <label class="field-label" for="c-pass">Temporary password</label>
+              <input class="input" id="c-pass" type="password" required minlength="12" autocomplete="new-password">
+              <div class="field-hint">Min 12 characters · must pass password policy (not containing username).</div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="c-role">Role</label>
+              <select class="select" id="c-role">
+                <option value="viewer">viewer</option>
+                <option value="editor">editor</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-3)">
+              <div class="field">
+                <label class="field-label" for="c-email">Email (notify)</label>
+                <input class="input" id="c-email" type="email" placeholder="dave@company.com" autocomplete="off">
+              </div>
+              <div class="field">
+                <label class="field-label" for="c-phone">Phone / SMS (notify)</label>
+                <input class="input" id="c-phone" type="tel" placeholder="+919876543210" autocomplete="off">
+              </div>
+            </div>
+            <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-3)">
+              <div class="field">
+                <label class="field-label" for="c-country">Usual country</label>
+                <input class="input" id="c-country" maxlength="10" placeholder="IN" value="IN">
+              </div>
+              <div class="field">
+                <label class="field-label" for="c-city">Usual city</label>
+                <input class="input" id="c-city" maxlength="100" placeholder="Gwalior" value="Gwalior">
+              </div>
+            </div>
+            <div id="c-err" class="field-error hidden"></div>
+          </form>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-ghost" type="button" data-act="cancel">Cancel</button>
+          <button class="btn btn-primary" type="button" data-act="submit">Create user</button>
+        </div>
+      </div>`;
+    document.body.appendChild(back);
+    const close = () => back.remove();
+    back.querySelector('[data-act=cancel]').addEventListener('click', close);
+    back.addEventListener('click', (e) => { if (e.target === back) close(); });
+    back.querySelector('[data-act=submit]').addEventListener('click', async () => {
+      const err = back.querySelector('#c-err');
+      err.classList.add('hidden');
+      const body = {
+        userId: back.querySelector('#c-user').value.trim(),
+        password: back.querySelector('#c-pass').value,
+        role: back.querySelector('#c-role').value,
+        email: back.querySelector('#c-email').value.trim() || undefined,
+        phone: back.querySelector('#c-phone').value.trim() || undefined,
+        usualCountry: back.querySelector('#c-country').value.trim() || undefined,
+        usualCity: back.querySelector('#c-city').value.trim() || undefined,
+        devices: [],
+      };
+      if (!body.userId || body.password.length < 12) {
+        err.textContent = 'Username and password (12+) required';
+        err.classList.remove('hidden');
+        return;
+      }
+      try {
+        const r = await post('/api/admin/users', body);
+        toast(
+          `Created ${r.userId}`
+            + (r.fabric ? ' · Fabric synced' : '')
+            + (r.notified ? ' · notification queued' : ''),
+          'success',
+          4500
+        );
+        close();
+        $('#f-status').value = 'ACTIVE';
+        load();
+      } catch (e) {
+        err.textContent = e.message + (e.data?.details ? ': ' + e.data.details.join(', ') : '');
+        err.classList.remove('hidden');
+      }
+    });
+  }
+
+  function openResetPassword(username) {
+    const back = document.createElement('div');
+    back.className = 'modal-backdrop';
+    back.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:420px">
+        <div class="modal-head"><h2 class="t-h2">Reset password · ${escape(username)}</h2></div>
+        <div class="modal-body">
+          <p class="t-small text-fg-2 mb-4">Sets a temporary password and revokes all sessions. Share it out-of-band; user should change it after login.</p>
+          <div class="field">
+            <label class="field-label" for="r-pass">New temporary password</label>
+            <input class="input" id="r-pass" type="password" minlength="12" autocomplete="new-password">
+          </div>
+          <div id="r-err" class="field-error hidden"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-ghost" data-act="cancel">Cancel</button>
+          <button class="btn btn-primary" data-act="submit">Reset password</button>
+        </div>
+      </div>`;
+    document.body.appendChild(back);
+    const close = () => back.remove();
+    back.querySelector('[data-act=cancel]').addEventListener('click', close);
+    back.querySelector('[data-act=submit]').addEventListener('click', async () => {
+      const err = back.querySelector('#r-err');
+      err.classList.add('hidden');
+      const newPassword = back.querySelector('#r-pass').value;
+      try {
+        await post(`/api/admin/users/${encodeURIComponent(username)}/reset-password`, { newPassword });
+        toast('Password reset · sessions revoked', 'success');
+        close();
+        load();
+      } catch (e) {
+        err.textContent = e.message;
+        err.classList.remove('hidden');
+      }
+    });
+  }
+
+  async function openDetail(username) {
+    const drawer = $('#drawer');
+    drawer.innerHTML = `<div class="empty"><p>Loading ${escape(username)}…</p></div>`;
+    try {
+      const d = await get(`/api/admin/users/${encodeURIComponent(username)}`);
+      drawer.innerHTML = `
+        <div class="card mt-5">
+          <div class="card-head">
+            <div>
+              <div class="t-h2">${escape(d.username || d.userId)}</div>
+              <div class="t-small mt-1">${statusPill(d.status)} · ${escape(d.role)}</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="close-detail">Close</button>
+          </div>
+          <div class="card-body">
+            <div class="grid" style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s-5)">
+              <div>
+                <div class="t-h3 mb-3">Profile</div>
+                <dl>
+                  <div class="detail-row"><dt>Tenant</dt><dd class="t-mono">${escape(d.tenantId || 'default')}</dd></div>
+                  <div class="detail-row"><dt>Usual location</dt><dd>${escape((d.usualLocation && (d.usualLocation.city + ', ' + d.usualLocation.country)) || '—')}</dd></div>
+                  <div class="detail-row"><dt>Normal hours</dt><dd class="t-mono">${escape((d.normalHours || []).join('–') || '—')}</dd></div>
+                  <div class="detail-row"><dt>Created</dt><dd>${escape(d.createdAt || '—')}</dd></div>
+                  <div class="detail-row"><dt>Fabric</dt><dd class="t-mono">${escape(d.fabric?.status || (d.fabric ? 'present' : 'not on chain / unavailable'))}</dd></div>
+                </dl>
+              </div>
+              <div>
+                <div class="t-h3 mb-3">Devices (${(d.devices || []).length})</div>
+                ${(d.devices || []).length ? `
+                  <table class="table" style="background:transparent">
+                    <thead><tr><th>Credential</th><th>Label</th><th></th></tr></thead>
+                    <tbody>
+                      ${(d.devices || []).map((dev) => `
+                        <tr>
+                          <td class="t-mono" style="font-size:11px">${escape((dev.deviceId || '').slice(0, 18))}${(dev.deviceId || '').length > 18 ? '…' : ''}</td>
+                          <td>${escape(dev.label || '—')}</td>
+                          <td><button class="btn btn-ghost btn-sm" data-revoke-dev="${escape(dev.deviceId)}">Revoke</button></td>
+                        </tr>`).join('')}
+                    </tbody>
+                  </table>` : '<p class="t-small text-fg-2">No devices yet — they appear after the user signs in.</p>'}
+                <div class="t-h3 mb-3 mt-5">Active sessions (${(d.sessions || []).length})</div>
+                ${(d.sessions || []).length
+                  ? `<p class="t-small text-fg-2">${(d.sessions || []).length} refresh-token families still valid.</p>`
+                  : '<p class="t-small text-fg-2">No active sessions.</p>'}
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('close-detail').addEventListener('click', () => { drawer.innerHTML = ''; });
+      drawer.querySelectorAll('[data-revoke-dev]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.revokeDev;
+          const ok = await confirm({
+            title: 'Revoke device?',
+            body: 'This browser credential will no longer be trusted for sign-in.',
+            danger: true, confirmLabel: 'Revoke device',
+          });
+          if (!ok) return;
+          try {
+            await del(`/api/admin/users/${encodeURIComponent(username)}/devices/${encodeURIComponent(id)}`);
+            toast('Device revoked', 'success');
+            openDetail(username);
+            load();
+          } catch (e) { toast(e.message, 'error'); }
+        });
+      });
+    } catch (e) {
+      drawer.innerHTML = `<div class="empty"><p>${escape(e.message)}</p></div>`;
+    }
+  }
+
+  document.getElementById('btn-create').addEventListener('click', openCreate);
   document.getElementById('refresh').addEventListener('click', load);
   $('#q').addEventListener('input', render);
-  $('#role').addEventListener('change', render);
+  $('#f-role').addEventListener('change', render);
+  $('#f-status').addEventListener('change', render);
   load();
 </script>
 </body>
